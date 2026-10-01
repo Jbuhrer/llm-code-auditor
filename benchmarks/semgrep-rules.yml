@@ -1,0 +1,21 @@
+rules:
+  - id: python-tainted-sql-string
+    languages: [python]
+    severity: ERROR
+    message: Possible SQL injection from string concatenation into a query.
+    metadata:
+      cwe: ["CWE-89"]
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.execute("..." + $X)
+          - pattern: |
+              $Q = "..." + $X
+              ...
+              $CONN.execute($Q)
+  - id: python-os-command-injection
+    languages: [python]
+    severity: ERROR
+    message: Possible OS command injection via os.system with concatenated input.
+    metadata:
+      cwe: ["CWE-78"]
+    pattern: os.system("..." + $X)

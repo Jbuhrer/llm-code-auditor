@@ -1,0 +1,21 @@
+# python
+venv/
+__pycache__/
+*.pyc
+
+# generated results and findings (keep these out of git, they're outputs)
+findings.json
+fps.json
+experiment_results.json
+run.log
+
+# benchmark slices (staged copies of Juliet — regenerate with the loader)
+benchmarks/juliet_slice*/
+benchmarks/mini/
+
+# backups
+*.bak
+
+# never commit keys
+.env
+*.key
