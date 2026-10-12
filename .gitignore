@@ -20,3 +20,4 @@ benchmarks/mini/
 .env
 *.key
 results/
+results/

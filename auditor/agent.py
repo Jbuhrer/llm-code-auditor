@@ -35,6 +35,7 @@ class AuditResult:
     output_tokens: int = 0
     turns: int = 0
     files_audited: int = 0
+    raw_findings: list[dict] = field(default_factory=list)  # pre-validation
 
     def as_dict(self):
         return asdict(self)
@@ -80,7 +81,8 @@ class Auditor:
             raw_findings.extend(hits)
             res.files_audited += 1
 
-        if raw_findings:
+        res.raw_findings = [dict(f) for f in raw_findings]  # keep a copy for analysis
+        if raw_findings and self.validate:
             print(f"  validating {len(raw_findings)} candidate(s)...", flush=True)
         findings = self._validate(raw_findings, res) if self.validate else raw_findings
 
