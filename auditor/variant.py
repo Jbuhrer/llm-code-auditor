@@ -14,11 +14,26 @@ from .tools import Workspace
 
 # per-bug-class search seeds: the sink shapes worth re-hunting once one is found
 CLASS_PATTERNS = {
-    "sqli": [r"\.execute\(", r"\.executemany\(", r"cursor\.", r"SELECT .*\+"],
-    "cmdi": [r"os\.system\(", r"subprocess\.", r"os\.popen\(", r"eval\(", r"exec\("],
-    "path": [r"open\(", r"os\.path\.join\(", r"\.\./", r"send_file\("],
+    "sqli": [r"\.execute\(", r"\.executemany\(", r"cursor\.", r"addBatch\(",
+             r"createStatement\(", r"SELECT .*\+"],
+    "cmdi": [r"os\.system\(", r"subprocess\.", r"os\.popen\(", r"eval\(",
+             r"exec\(", r"Runtime\.getRuntime", r"ProcessBuilder"],
+    "path": [r"open\(", r"os\.path\.join\(", r"\.\./", r"send_file\(",
+             r"FileInputStream", r"new File\(", r"Paths\.get"],
     "npd":  [r"->", r"\bdereference\b"],
     "uaf":  [r"free\(", r"delete "],
+    # broader classes exhaustive mode may surface
+    "ssrf": [r"requests\.(get|post)\(", r"urlopen\(", r"HttpURLConnection",
+             r"\.openConnection\(", r"fetch\(", r"curl"],
+    "xxe":  [r"DocumentBuilder", r"SAXParser", r"XMLReader", r"etree\.parse"],
+    "deserialization": [r"pickle\.loads", r"ObjectInputStream", r"yaml\.load\(",
+                        r"readObject\(", r"Marshal"],
+    "xss":  [r"innerHTML", r"document\.write", r"render_template_string",
+             r"\.html\(", r"dangerouslySetInnerHTML"],
+    "ssti": [r"render_template_string", r"Template\(", r"\.render\("],
+    "crypto": [r"\bMD5\b", r"\bSHA1\b", r"\bDES\b", r"\bECB\b", r"Random\(",
+               r"math\.random", r"hardcoded", r"secret\s*="],
+    "idor": [r"findById", r"get_object_or_404", r"request\.(args|params|GET)"],
 }
 
 

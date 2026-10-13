@@ -18,7 +18,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
     ap.add_argument("--bugs", nargs="+", default=["sqli", "cmdi", "path"],
-                    choices=list(BUG_CLASSES))
+                    help="bug classes, or 'all' for exhaustive open-ended hunting")
+    ap.add_argument("--exhaustive", action="store_true",
+                    help="hunt ANY vulnerability class from the model's own "
+                         "security knowledge (same as --bugs all)")
     ap.add_argument("--max-turns", type=int, default=12,
                     help="max turns PER FILE (each file is its own conversation)")
     ap.add_argument("--no-validate", action="store_true")
@@ -28,6 +31,8 @@ def main():
                     help="hunt variants of each confirmed finding (ToB-style)")
     ap.add_argument("--out", default="findings.json")
     a = ap.parse_args()
+    if a.exhaustive:
+        a.bugs = ["all"]
 
     auditor = Auditor(a.repo, a.bugs, max_turns=a.max_turns,
                       validate=not a.no_validate,

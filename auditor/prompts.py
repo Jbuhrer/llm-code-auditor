@@ -20,14 +20,36 @@ BUG_CLASSES = {
 
 
 def system_prompt(bug_classes: list[str]) -> str:
-    selected = "\n".join(f"- {k}: {BUG_CLASSES[k]}" for k in bug_classes if k in BUG_CLASSES)
+    # Exhaustive mode: empty list, ["all"], or ["*"] lets the agent hunt ANY
+    # vulnerability class from its own security knowledge, not a fixed list.
+    exhaustive = (not bug_classes) or any(b in ("all", "*", "any")
+                                          for b in bug_classes)
+    if exhaustive:
+        scope = (
+            "You are hunting for ANY security vulnerability, drawing on your full "
+            "knowledge of software security. Do not limit yourself to a fixed list. "
+            "Consider at least: injection (SQL, OS command, LDAP, XPath, template, "
+            "expression-language), path traversal, SSRF, XXE, insecure "
+            "deserialization, unsafe reflection, authentication and authorization "
+            "flaws (missing checks, IDOR, broken access control), cryptographic "
+            "misuse (weak algorithms, hardcoded keys, bad randomness, missing "
+            "verification), memory-safety bugs in native code (buffer overflow, "
+            "use-after-free, OOB access, integer overflow leading to one), race "
+            "conditions and TOCTOU, SSTI and XSS, open redirect, unsafe file "
+            "upload, secrets in source, logic flaws that break a security "
+            "invariant, and any other class you can justify from the code. "
+            "If you spot something that does not fit a known class but is clearly "
+            "a security problem, report it with the closest CWE and explain it.")
+    else:
+        selected = "\n".join(f"- {k}: {BUG_CLASSES[k]}" for k in bug_classes
+                             if k in BUG_CLASSES)
+        scope = f"You are hunting for these bug classes:\n{selected}"
     return f"""You are a security code auditor. You audit a real code repository \
 the way an expert human does: you explore on demand, follow data from where it \
 enters the program (a source) to where it is dangerously used (a sink), and you \
 only report a bug when you can trace a concrete, feasible path from source to sink.
 
-You are hunting for these bug classes:
-{selected}
+{scope}
 
 How to work:
 1. Use list_dir and grep to locate candidate sources (input entry points) and
@@ -39,6 +61,14 @@ How to work:
 4. Form a hypothesis as a source -> sink data-flow claim, then verify the path is
    actually reachable and the input is actually attacker-controlled. If you cannot
    verify reachability, do NOT report it.
+5. Reason beyond pattern matching. A grep hit is a lead, not a bug, and a bug with
+   no obvious dangerous-looking call can still be real. Think about what the code
+   is TRYING to guarantee (an auth check, a bound, an invariant) and whether an
+   input can break that guarantee. Consider non-obvious sources (config, headers,
+   deserialized objects, filenames, DB rows written by another path) and indirect
+   sinks reached through helper methods or other files.
+6. When one bug is confirmed, briefly consider whether the same mistake recurs
+   elsewhere, and whether a nearby weakness could be chained with it.
 
 Precision matters more than recall for this project. A false positive is worse
 than a missed bug. When unsure, gather one more piece of evidence or drop it.
