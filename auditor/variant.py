@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 
 from .tools import Workspace
+from .classes import canonical_class
 
 # per-bug-class search seeds: the sink shapes worth re-hunting once one is found
 CLASS_PATTERNS = {
@@ -40,7 +41,7 @@ CLASS_PATTERNS = {
 def find_variants(ws: Workspace, finding: dict, max_hits: int = 40) -> list[str]:
     """Return grep hit lines for patterns matching this finding's bug class,
     excluding the file:line of the original finding."""
-    cls = finding.get("bug_class", "")
+    cls = canonical_class(finding)
     patterns = CLASS_PATTERNS.get(cls, [])
     origin_file = finding.get("file", "")
     origin_line = finding.get("line", -1)

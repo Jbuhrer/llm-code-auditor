@@ -1,0 +1,86 @@
+{
+  "findings": [
+    {
+      "bug_class": "OS Command Injection",
+      "file": "CWE78_OS_Command_Injection__Environment_01.java",
+      "line": 46,
+      "cwe": "CWE-78",
+      "severity": "CRITICAL",
+      "confidence": 0.95,
+      "path": "System.getenv(\"ADD\") [line 31] \u2192 data [unsanitised String] \u2192 osCommand + data [line 46] \u2192 Runtime.getRuntime().exec(osCommand + data) [line 46]",
+      "validator_reason": "System.getenv(\"ADD\") returns fully attacker-controlled data (anyone who can set process environment variables controls it), no sanitization exists, and it is concatenated directly into a shell command string passed to Runtime.exec(), enabling injection of additional commands via shell metacharacters when the OS parses the combined string."
+    },
+    {
+      "bug_class": "OS Command Injection",
+      "file": "CWE78_OS_Command_Injection__Environment_02.java",
+      "line": 54,
+      "cwe": "CWE-78",
+      "severity": "critical",
+      "confidence": 0.95,
+      "path": "System.getenv(\"ADD\") [line 32] \u2192 data [line 32, always via if(true)] \u2192 osCommand + data [line 54] \u2192 Runtime.getRuntime().exec() [line 54]",
+      "validator_reason": "The environment variable ADD is read without sanitization and concatenated directly into a shell command string passed to Runtime.exec(), allowing an attacker who can set environment variables to inject arbitrary OS commands."
+    },
+    {
+      "bug_class": "SQL Injection via executeBatch string concatenation",
+      "file": "CWE89_SQL_Injection__Environment_executeBatch_01.java",
+      "line": 50,
+      "cwe": "CWE-89",
+      "severity": "HIGH",
+      "confidence": 0.98,
+      "path": "System.getenv(\"ADD\") [line 35] \u2192 data.split(\"-\") [line 39] \u2192 names[i] concatenated into SQL string [line 50] \u2192 sqlStatement.addBatch() \u2192 sqlStatement.executeBatch() [line 52]",
+      "validator_reason": "Attacker-controlled environment variable ADD is split on '-' and each token is directly concatenated into a SQL string passed to addBatch() with no sanitization or parameterization, allowing arbitrary SQL injection via a crafted ADD value such as \"alice' OR '1'='1\"."
+    },
+    {
+      "bug_class": "SQL Injection",
+      "file": "CWE89_SQL_Injection__Environment_executeBatch_02.java",
+      "line": 60,
+      "cwe": "CWE-89",
+      "severity": "HIGH",
+      "confidence": 0.98,
+      "path": "System.getenv(\"ADD\") [line 36] \u2192 data.split(\"-\") [line 49] \u2192 names[i] concatenated into SQL string in sqlStatement.addBatch() [line 60] \u2192 sqlStatement.executeBatch() [line 62]",
+      "validator_reason": "Attacker-controlled environment variable ADD is read without sanitization, split on '-', and each element directly concatenated into a SQL batch statement, allowing arbitrary SQL injection via a name containing single quotes or SQL metacharacters."
+    }
+  ],
+  "input_tokens": 123978,
+  "output_tokens": 6696,
+  "turns": 18,
+  "files_audited": 4,
+  "raw_findings": [
+    {
+      "bug_class": "OS Command Injection",
+      "file": "CWE78_OS_Command_Injection__Environment_01.java",
+      "line": 46,
+      "cwe": "CWE-78",
+      "severity": "CRITICAL",
+      "confidence": 1.0,
+      "path": "System.getenv(\"ADD\") [line 31] \u2192 data [unsanitised String] \u2192 osCommand + data [line 46] \u2192 Runtime.getRuntime().exec(osCommand + data) [line 46]"
+    },
+    {
+      "bug_class": "OS Command Injection",
+      "file": "CWE78_OS_Command_Injection__Environment_02.java",
+      "line": 54,
+      "cwe": "CWE-78",
+      "severity": "critical",
+      "confidence": 1.0,
+      "path": "System.getenv(\"ADD\") [line 32] \u2192 data [line 32, always via if(true)] \u2192 osCommand + data [line 54] \u2192 Runtime.getRuntime().exec() [line 54]"
+    },
+    {
+      "bug_class": "SQL Injection via executeBatch string concatenation",
+      "file": "CWE89_SQL_Injection__Environment_executeBatch_01.java",
+      "line": 50,
+      "cwe": "CWE-89",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "path": "System.getenv(\"ADD\") [line 35] \u2192 data.split(\"-\") [line 39] \u2192 names[i] concatenated into SQL string [line 50] \u2192 sqlStatement.addBatch() \u2192 sqlStatement.executeBatch() [line 52]"
+    },
+    {
+      "bug_class": "SQL Injection",
+      "file": "CWE89_SQL_Injection__Environment_executeBatch_02.java",
+      "line": 60,
+      "cwe": "CWE-89",
+      "severity": "HIGH",
+      "confidence": 1.0,
+      "path": "System.getenv(\"ADD\") [line 36] \u2192 data.split(\"-\") [line 49] \u2192 names[i] concatenated into SQL string in sqlStatement.addBatch() [line 60] \u2192 sqlStatement.executeBatch() [line 62]"
+    }
+  ]
+}

@@ -7,7 +7,11 @@ Scoring. Two modes:
             test case are not penalised; findings in unlabelled test cases are FPs.
 """
 import re
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from auditor.classes import canonical_class  # noqa: E402
 
 LINE_TOLERANCE = 5
 
@@ -19,7 +23,7 @@ def testcase_id(file: str) -> str:
 def matches(finding: dict, label: dict) -> bool:
     return (
         Path(finding.get("file", "")).name == Path(label["file"]).name
-        and finding.get("bug_class") == label["bug_class"]
+        and canonical_class(finding) == label["bug_class"]
         and abs(finding.get("line", -999) - label["line"]) <= LINE_TOLERANCE
     )
 
@@ -47,7 +51,7 @@ def score_testcase(findings, labels):
     units = {(testcase_id(l["file"]), l["bug_class"]) for l in labels}
     hit, fp = set(), 0
     for f in findings:
-        key = (testcase_id(f.get("file", "")), f.get("bug_class"))
+        key = (testcase_id(f.get("file", "")), canonical_class(f))
         if key in units:
             hit.add(key)
         else:
