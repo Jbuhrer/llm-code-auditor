@@ -1,13 +1,19 @@
 """
-Scoring shared by the benchmark and experiment runners.
-
-A finding is a true positive if it matches a ground-truth label on file name +
-bug_class and lands within LINE_TOLERANCE lines. Data-flow bugs are reported at
-the sink, which can sit a few lines off the labelled point, hence the tolerance.
+Scoring. Two modes:
+  line      file + bug_class + within LINE_TOLERANCE lines (strict).
+  testcase  (default) standard Juliet scoring: one bad flow per test case.
+            Correct if the right bug class is reported in any file of the right
+            test case (..._22a/_22b share one id). Extra findings in an already-hit
+            test case are not penalised; findings in unlabelled test cases are FPs.
 """
+import re
 from pathlib import Path
 
 LINE_TOLERANCE = 5
+
+
+def testcase_id(file: str) -> str:
+    return re.sub(r"(\d+)[a-z]$", r"\1", Path(file).stem)
 
 
 def matches(finding: dict, label: dict) -> bool:
@@ -18,7 +24,15 @@ def matches(finding: dict, label: dict) -> bool:
     )
 
 
-def score(findings: list[dict], labels: list[dict]) -> dict:
+def _prf(tp, fp, fn):
+    p = tp / (tp + fp) if (tp + fp) else 0.0
+    r = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = 2 * p * r / (p + r) if (p + r) else 0.0
+    return {"tp": tp, "fp": fp, "fn": fn,
+            "precision": round(p, 3), "recall": round(r, 3), "f1": round(f1, 3)}
+
+
+def score_line(findings, labels):
     tp, matched = 0, set()
     for f in findings:
         hit = next((i for i, l in enumerate(labels)
@@ -26,11 +40,21 @@ def score(findings: list[dict], labels: list[dict]) -> dict:
         if hit is not None:
             tp += 1
             matched.add(hit)
-    fp = len(findings) - tp
-    fn = len(labels) - tp
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    return {"tp": tp, "fp": fp, "fn": fn,
-            "precision": round(precision, 3), "recall": round(recall, 3),
-            "f1": round(f1, 3)}
+    return _prf(tp, len(findings) - tp, len(labels) - tp)
+
+
+def score_testcase(findings, labels):
+    units = {(testcase_id(l["file"]), l["bug_class"]) for l in labels}
+    hit, fp = set(), 0
+    for f in findings:
+        key = (testcase_id(f.get("file", "")), f.get("bug_class"))
+        if key in units:
+            hit.add(key)
+        else:
+            fp += 1
+    return _prf(len(hit), fp, len(units) - len(hit))
+
+
+def score(findings, labels, mode="testcase"):
+    return score_testcase(findings, labels) if mode == "testcase" \
+        else score_line(findings, labels)

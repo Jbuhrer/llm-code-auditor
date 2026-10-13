@@ -178,57 +178,50 @@ def load_manifest(juliet_dir: Path) -> dict[str, list[int]]:
 
 # ---------- slice building ----------
 
+def _testcase_key(p: Path) -> str:
+    return re.sub(r"(\d+)[a-z]$", r"\1", p.stem)
+
+
 def build_slice(juliet_dir: Path, cwes: list[str], per_cwe: int,
                 out_dir: Path) -> list[dict]:
+    """Select up to per_cwe TEST CASES per CWE; split cases (_22a/_22b,
+    _51a/_51b) are always copied together."""
     manifest = load_manifest(juliet_dir)
-    if manifest:
-        print(f"using manifest with {len(manifest)} flaw files")
-    else:
-        print("no manifest found; falling back to POTENTIAL FLAW comments")
-
+    print(f"using manifest with {len(manifest)} flaw files" if manifest
+          else "no manifest found; falling back to POTENTIAL FLAW comments")
     out_dir.mkdir(parents=True, exist_ok=True)
     labels: list[dict] = []
-    used_names: set[str] = set()
     counts = {c: 0 for c in cwes}
+    groups: dict[str, list[Path]] = {}
+    for p in sorted(juliet_dir.rglob("*")):
+        if p.suffix in SRC_EXTS and cwe_of_path(p) in cwes:
+            groups.setdefault(_testcase_key(p), []).append(p)
 
-    # candidate source files under the selected CWEs, single-file cases first
-    candidates = sorted(
-        p for p in juliet_dir.rglob("*")
-        if p.suffix in SRC_EXTS and cwe_of_path(p) in cwes
-    )
+    def flaws_for(src: Path) -> list[int]:
+        for mpath, lines in manifest.items():
+            if str(src).endswith(mpath) or Path(mpath).name == src.name:
+                return lines
+        return flaws_from_comments(src)
 
-    for src in candidates:
-        cwe = cwe_of_path(src)
+    for key, files in groups.items():
+        cwe = cwe_of_path(files[0])
         if cwe is None or counts[cwe] >= per_cwe:
             continue
         bug_class = CWE_TO_CLASS[cwe]
-
-        # find flaw lines: manifest match (by suffix) or comment fallback
-        flaw_lines: list[int] = []
-        for mpath, lines in manifest.items():
-            if str(src).endswith(mpath) or Path(mpath).name == src.name:
-                flaw_lines = lines
-                break
-        if not flaw_lines:
-            flaw_lines = flaws_from_comments(src)
-        if not flaw_lines:
-            continue  # nothing to label; skip
-
-        # collapse to the sink line(s) the agent is actually graded on
-        flaw_lines = filter_to_sinks(src, flaw_lines, bug_class)
-
-        # stage the file (unique basename so labels match on name)
-        name = src.name
-        if name in used_names:
-            name = f"{cwe}_{src.name}"
-        used_names.add(name)
-        shutil.copy2(src, out_dir / name)
-
-        for ln in sorted(set(flaw_lines)):
-            labels.append({"file": name, "line": ln, "bug_class": bug_class})
+        case_labels = []
+        for src in files:
+            fl = flaws_for(src)
+            if fl:
+                fl = filter_to_sinks(src, fl, bug_class)
+                case_labels += [{"file": src.name, "line": ln, "bug_class": bug_class}
+                                for ln in sorted(set(fl))]
+        if not case_labels:
+            continue
+        for src in files:
+            shutil.copy2(src, out_dir / src.name)
+        labels += case_labels
         counts[cwe] += 1
-
-    print("selected per CWE:", {k: counts[k] for k in cwes})
+    print("selected test cases per CWE:", {k: counts[k] for k in cwes})
     return labels
 
 
