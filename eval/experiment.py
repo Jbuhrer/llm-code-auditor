@@ -263,8 +263,10 @@ def main():
                          "all, or items joined by + (path, sanitizer, conditions, poc)")
     ap.add_argument("--evidence-sweep", action="store_true",
                     help="RO2: plain, each evidence item alone, and all")
-    ap.add_argument("--unit", choices=["file", "testcase", "repo"], default=None,
-                    help="default: testcase for Juliet labels, file otherwise")
+    ap.add_argument("--unit", default=None,
+                    choices=["file", "testcase", "repo", "project-file", "project-file-all"],
+                    help="default: testcase for Juliet, project-file (pre-filtered, one project "
+                         "per unit) for CWE-Bench-Java, file otherwise")
     ap.add_argument("--budget", type=int, default=24000, help="context tokens per unit")
     ap.add_argument("--max-turns", type=int, default=15)
     ap.add_argument("--effort", default="medium", help="Claude effort, held fixed")
@@ -289,8 +291,9 @@ def main():
 
     labels = json.loads(Path(a.labels).read_text())
     ws = Workspace(a.repo)
-    unit_mode = a.unit or ("testcase" if default_mode(labels) == "function" else "file")
-    units = build_units(ws, unit_mode)
+    mode = default_mode(labels)
+    unit_mode = a.unit or {"function": "testcase", "method": "project-file"}.get(mode, "file")
+    units = build_units(ws, unit_mode, list(a.bugs))
     if a.limit:
         units = spread_limit(units, a.limit)
     base = AuditConfig(context_budget=a.budget, max_turns=a.max_turns, effort=a.effort,

@@ -129,9 +129,11 @@ def main():
 
     # ------------------------------------------------------------ RO1 + RO3
     md.append("## RO1 / RO3: ablation table\n")
-    md.append("| preset | model | cell | validation | runs | recall | precision | "
-              "FP rate | finding FDR | localization | tokens | $ | $/TP | sec | "
-              "refusals | errors |")
+    # real CVEs: precision is unknowable without triage, so show what is measurable
+    mid = ("file recall | alerts/project | off-target" if mode == "method"
+           else "precision | FP rate | finding FDR | localization")
+    md.append("| preset | model | cell | validation | runs | recall | " + mid +
+              " | tokens | $ | $/TP | sec | refusals | errors |")
     md.append("|" + "---|" * 16)
     case_runs: dict[tuple, list[dict]] = {}
     def order(key):
@@ -157,8 +159,14 @@ def main():
         refus = sum(r["refusals"] + r.get("val_refusals", 0) for r in runs)
         errs = sum(r["errors"] + r.get("val_errors", 0) for r in runs)
         preset = ", ".join(names.get(key, [])) or "-"
+        if mode == "method":
+            mid_cells = (f"{median(r['score'].get('file_recall', 0) for r in runs):.3f} | "
+                         f"{median(r['score'].get('alerts_per_project', 0) for r in runs):.1f} | "
+                         f"{median(r['score'].get('off_target_findings', 0) for r in runs):.0f}")
+        else:
+            mid_cells = f"{fmt_ci(prec)} | {fmt_ci(fpr)} | {fdr:.3f} | {loc:.3f}"
         md.append(f"| {preset} | {model} | {cell} | {val} | {len(runs)} | {fmt_ci(rec)} | "
-                  f"{fmt_ci(prec)} | {fmt_ci(fpr)} | {fdr:.3f} | {loc:.3f} | {toks:,.0f} | "
+                  f"{mid_cells} | {toks:,.0f} | "
                   f"{'-' if cost is None else f'{cost:.2f}'} | "
                   f"{'-' if cpt is None else f'{cpt:.3f}'} | {sec:.0f} | {refus} | {errs} |")
         js["rows"].append({"model": model, "cell": cell, "validation": val,

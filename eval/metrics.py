@@ -18,6 +18,7 @@ pairwise (McNemar) in eval/stats.py.
 """
 from __future__ import annotations
 import re
+from collections import Counter
 import sys
 from pathlib import Path
 
@@ -141,7 +142,60 @@ def score_function(findings, labels, repo: str | Path):
     return s
 
 
+def score_method(findings, labels, repo: str | Path):
+    """Real-CVE scoring (CWE-Bench-Java). A case is one CVE. It's detected when a
+    finding of the right class lands inside one of the methods its fix changed,
+    located by name in the audited (vulnerable) file, since fix_info line numbers
+    come from the fix commit. A class-level fix (no method) counts on the file.
+    Findings outside every fixed method can't be called false (the project may
+    have other real bugs), so they're reported as off-target alerts."""
+    repo = Path(repo)
+    cases: dict[str, dict] = {}
+    targets: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for l in labels:
+        cve = l.get("cve") or l.get("project") or l["file"]
+        cases.setdefault(cve, {"class": l["bug_class"], "hit": False, "file_hit": False,
+                               "project": l.get("project", "")})
+        targets.setdefault((l["file"], l["bug_class"]), []).append((cve, l.get("method", "")))
+
+    on_target, alerts = 0, Counter()
+    for f in findings:
+        path = str(f.get("file", "")).replace("\\", "/")
+        alerts[path.split("/", 1)[0]] += 1
+        hits = targets.get((path, canonical_class(f)))
+        if not hits:
+            continue
+        fn, _ = locate(repo / path, _line(f))
+        matched = False
+        for cve, method in hits:
+            cases[cve]["file_hit"] = True
+            if not method or (fn and fn == method):
+                cases[cve]["hit"] = True
+                matched = True
+        on_target += matched
+
+    tp = sum(c["hit"] for c in cases.values())
+    s = _prf(tp, 0, len(cases) - tp)
+    n = len(findings)
+    projects = {c["project"] for c in cases.values() if c["project"]} or set(alerts)
+    s.update({
+        "cases": {k: {"hit": v["hit"], "fp": False} for k, v in cases.items()},
+        "findings": n,
+        "file_recall": round(sum(c["file_hit"] for c in cases.values()) / len(cases), 3)
+        if cases else 0.0,
+        "on_target_findings": on_target,
+        "off_target_findings": n - on_target,
+        "alerts_per_project": round(n / len(projects), 2) if projects else 0.0,
+    })
+    s.pop("fdr", None)   # unknowable without triage; see off_target_findings
+    return s
+
+
 def score(findings, labels, mode="testcase", repo=None):
+    if mode == "method":
+        if repo is None:
+            raise ValueError("method scoring needs the benchmark repo path")
+        return score_method(findings, labels, repo)
     if mode == "function":
         if repo is None:
             raise ValueError("function scoring needs the benchmark repo path")
@@ -153,5 +207,7 @@ def score(findings, labels, mode="testcase", repo=None):
 
 def default_mode(labels) -> str:
     """Juliet labels (CWE-named files) score by function; anything else by line."""
+    if labels and all("project" in l and "method" in l for l in labels):
+        return "method"
     juliet = labels and all(re.match(r"CWE\d+_", _name(l["file"])) for l in labels)
     return "function" if juliet else "line"

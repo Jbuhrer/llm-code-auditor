@@ -22,3 +22,6 @@ benchmarks/mini/
 .env
 *.key
 results/
+
+# CWE-Bench-Java data and project sources (rebuild with the loader)
+benchmarks/cwe_bench_java/

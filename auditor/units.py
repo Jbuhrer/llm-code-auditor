@@ -51,7 +51,32 @@ class Unit:
     root: str = ""
 
 
-def build_units(ws: Workspace, mode: str) -> list[Unit]:
+def build_project_units(ws: Workspace, classes: list[str],
+                        prefilter: bool = True) -> tuple[list[Unit], dict]:
+    """One unit per kept file, confined to its project (a top-level folder of
+    the workspace). Test code is dropped; with prefilter, so are files that never
+    mention an API relevant to the classes. Returns (units, stats)."""
+    from .prefilter import keep, is_test
+    units, stats = [], {}
+    for f in ws.source_files():
+        project, _, inner = f.partition("/")
+        if not inner:
+            continue
+        s = stats.setdefault(project, {"files": 0, "tests": 0, "kept": 0})
+        s["files"] += 1
+        if is_test(inner):
+            s["tests"] += 1
+            continue
+        if prefilter and not keep("\n".join(ws.lines(f)), classes):
+            continue
+        s["kept"] += 1
+        units.append(Unit(f, [f], root=project))
+    return units, stats
+
+
+def build_units(ws: Workspace, mode: str, classes: list[str] | None = None) -> list[Unit]:
+    if mode in ("project-file", "project-file-all"):
+        return build_project_units(ws, classes or [], mode == "project-file")[0]
     files = ws.source_files()
     if mode == "repo":
         return [Unit("<repo>", [])]
