@@ -45,6 +45,10 @@ def testcase_key(path: str) -> str:
 class Unit:
     id: str
     targets: list[str] = field(default_factory=list)   # empty = whole repo
+    # Optional subdirectory the unit's tools are confined to (one project in a
+    # multi-project benchmark). Targets stay repo-relative; the agent sees paths
+    # relative to this root, and findings are mapped back.
+    root: str = ""
 
 
 def build_units(ws: Workspace, mode: str) -> list[Unit]:

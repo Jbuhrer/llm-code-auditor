@@ -215,3 +215,33 @@ def test_budget_cap_stops_saves_and_resumes(tmp_path, monkeypatch):
     assert len(calls) == 3                   # only the unfinished unit was paid for
     assert len(json.loads((run / "audit.json").read_text())["units"]) == 3
     assert not (run / "audit.partial.jsonl").exists()
+
+
+def test_scoped_unit_tools_stay_in_its_project(tmp_path):
+    """Multi-project benchmarks: a unit's tools see only its own project, and
+    findings come back with repo-relative paths."""
+    from auditor.units import Unit
+    from tests.conftest import reply, report
+    for p in ("projA", "projB"):
+        (tmp_path / p / "src").mkdir(parents=True)
+        (tmp_path / p / "src" / "Main.java").write_text(f"class Main {{ /* {p} marker */ }}\n")
+    ws = Workspace(str(tmp_path))
+    fb = FakeBackend([
+        reply(calls=[("t1", "grep", {"pattern": "marker"})]),
+        report([{"bug_class": "path", "file": "src/Main.java", "line": 1,
+                 "cwe": "CWE-22", "confidence": 0.9}])])
+    a = Auditor(ws, replace(AuditConfig(), static_analysis=False), fb)
+    rec = a.run_unit(Unit("projA:Main", ["projA/src/Main.java"], root="projA"))
+    grep_out = fb.conversations[0].sent[1][1][0][1]
+    assert "projA marker" in grep_out and "projB" not in grep_out
+    assert rec["findings"][0]["file"] == "projA/src/Main.java"
+    assert rec["targets"] == ["projA/src/Main.java"] and rec["root"] == "projA"
+
+
+@pytest.mark.parametrize("cwe,cls", [("CWE-094", "codei"), ("CWE-022", "path"),
+                                     ("CWE-078", "cmdi"), ("CWE-079", "xss"),
+                                     ("CWE-94", "codei")])
+def test_zero_padded_cwe_ids(cwe, cls):
+    """CWE-Bench-Java writes CWE-094; it must map the same as CWE-94."""
+    from auditor.classes import canonical_class
+    assert canonical_class({"cwe": cwe}) == cls

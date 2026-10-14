@@ -11,6 +11,7 @@ CWE_TO_CLASS = {
     "327": "crypto", "328": "crypto", "330": "crypto", "338": "crypto",
     "798": "crypto", "321": "crypto",
     "639": "idor", "284": "idor", "285": "idor", "862": "idor", "863": "idor",
+    "94": "codei", "95": "codei", "917": "codei",
 }
 
 KEYWORDS = [
@@ -27,6 +28,8 @@ KEYWORDS = [
     ("idor", ("idor", "access control", "authorization", "insecure direct")),
     ("npd", ("null pointer", "null dereference")),
     ("uaf", ("use after free", "use-after-free")),
+    ("codei", ("code injection", "expression language", "el injection",
+               "ognl", "spel", "script injection", "eval injection")),
 ]
 
 
@@ -35,8 +38,9 @@ def canonical_class(finding: dict) -> str:
     if raw in {c for c, _ in KEYWORDS}:
         return raw
     m = re.search(r"(\d+)", str(finding.get("cwe", "")))
-    if m and m.group(1) in CWE_TO_CLASS:
-        return CWE_TO_CLASS[m.group(1)]
+    cwe = str(int(m.group(1))) if m else ""   # "CWE-094" and "CWE-94" are the same
+    if cwe in CWE_TO_CLASS:
+        return CWE_TO_CLASS[cwe]
     for cls, words in KEYWORDS:
         if any(w in raw for w in words):
             return cls

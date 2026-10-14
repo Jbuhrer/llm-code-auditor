@@ -20,6 +20,11 @@ BUG_CLASSES = {
     "path": "Path traversal: untrusted input reaching a filesystem path.",
     "npd": "Null pointer dereference: a null/None value reaching a dereference on a feasible path.",
     "uaf": "Use-after-free: memory used after it has been freed.",
+    "xss": "Cross-site scripting: untrusted input written into an HTML/JS response "
+           "without context-appropriate encoding.",
+    "codei": "Code injection: untrusted input evaluated as code, e.g. by a script "
+             "engine, expression language (EL/OGNL/SpEL/MVEL), template engine, or "
+             "dynamic class loading.",
 }
 
 EXHAUSTIVE_SCOPE = (

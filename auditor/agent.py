@@ -16,6 +16,7 @@ turns, refusals and errors, so cost and failures are visible per cell (RO3).
 """
 from __future__ import annotations
 import json
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -74,6 +75,8 @@ def _new_record(unit: Unit) -> dict:
 class Auditor:
     def __init__(self, ws: Workspace, cfg: AuditConfig, backend):
         self.ws, self.cfg, self.backend = ws, cfg, backend
+        self._sub_auditors: dict[str, "Auditor"] = {}
+        self._sub_lock = threading.Lock()
         self.explore = cfg.exploration == "explore"
         self.tools = tool_schemas(self.explore, cfg.static_analysis)
         self.allowed = {t["name"] for t in self.tools}
@@ -88,8 +91,9 @@ class Auditor:
         """Run every unit; returns records in unit order. on_done(rec) is called
         as each unit finishes (for checkpointing and budget). Once should_stop()
         is true, units that haven't started are skipped and left out."""
-        if self.cfg.static_analysis:
+        if self.cfg.static_analysis and not any(u.root for u in units):
             # one scan up front, so worker threads share the cache instead of racing
+            # (scoped units scan their own project instead, in _run_scoped)
             try:
                 self.ws.semgrep_results(".", self.cfg.semgrep_config)
             except Exception as e:
@@ -115,6 +119,8 @@ class Auditor:
         return [r for r in out if r is not None]
 
     def run_unit(self, unit: Unit) -> dict:
+        if unit.root:
+            return self._run_scoped(unit)
         rec = _new_record(unit)
         t0 = time.monotonic()
         try:
@@ -129,6 +135,30 @@ class Auditor:
         rec["seconds"] = round(time.monotonic() - t0, 2)
         rec["cost_usd"] = cost_usd(self.cfg.model, rec["usage"])
         rec["findings"] = self._normalize(unit, rec)
+        return rec
+
+    def _run_scoped(self, unit: Unit) -> dict:
+        """Run a unit with every tool confined to unit.root, then map paths back
+        to repo-relative so scoring and validation see the same names."""
+        prefix = unit.root.strip("/") + "/"
+        with self._sub_lock:   # one sub-auditor (and one semgrep scan) per project
+            sub = self._sub_auditors.get(prefix)
+            if sub is None:
+                sub = Auditor(Workspace(str(self.ws.root / unit.root)), self.cfg,
+                              self.backend)
+                if self.cfg.static_analysis:
+                    try:
+                        sub.ws.semgrep_results(".", self.cfg.semgrep_config)
+                    except Exception:
+                        pass   # recorded per unit as semgrep_error in fixed mode
+                self._sub_auditors[prefix] = sub
+        local = Unit(unit.id, [t[len(prefix):] if t.startswith(prefix) else t
+                               for t in unit.targets])
+        rec = sub.run_unit(local)
+        rec["targets"] = unit.targets
+        rec["root"] = unit.root
+        for f in rec["findings"]:
+            f["file"] = prefix + str(f.get("file", "")).lstrip("/")
         return rec
 
     # ------------------------------------------------------------ modes
