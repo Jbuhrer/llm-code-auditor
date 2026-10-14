@@ -25,6 +25,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -34,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from auditor.agent import Auditor, FatalBackendError                # noqa: E402
 from auditor.baseline import semgrep_baseline                       # noqa: E402
+from auditor.budget import Budget, BudgetExceeded                   # noqa: E402
 from auditor.config import (AuditConfig, ValidationConfig, PRESETS,  # noqa: E402
                             full_factorial, validation_variants, EVIDENCE)
 from auditor.llm import make_backend                                # noqa: E402
@@ -99,6 +101,26 @@ def write_json(path: Path, obj) -> None:
     os.replace(tmp, path)
 
 
+def append_jsonl(path: Path, obj) -> None:
+    """One record per line, flushed right away, so a stop loses nothing finished."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, default=str) + "\n")
+
+
+def read_jsonl(path: Path) -> list:
+    """Records from a checkpoint file. A torn last line (killed mid-write) is skipped."""
+    if not path.exists():
+        return []
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
 def spread_limit(units, n: int):
     """First n units, round-robin across CWEs (or top-level dirs), so a smoke
     test with --limit covers every bug class instead of one alphabetical run."""
@@ -153,7 +175,25 @@ def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
     cfg: AuditConfig = cell["audit"]
     backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
     t0 = time.monotonic()
-    recs = Auditor(ws, cfg, backend).run_units(units, a.workers, log)
+    part = out_dir / "audit.partial.jsonl"
+    done = {r["unit"]: r for r in read_jsonl(part)}
+    if done:
+        log(f"  resuming: {len(done)} unit(s) already done")
+    lock = threading.Lock()
+
+    def save(rec):
+        a.spend.add(rec["cost_usd"])
+        with lock:
+            append_jsonl(part, rec)
+
+    todo = [u for u in units if u.id not in done]
+    new = Auditor(ws, cfg, backend).run_units(
+        todo, a.workers, log, on_done=save, should_stop=lambda: a.spend.exceeded)
+    for r in new:
+        done[r["unit"]] = r
+    if len(done) < len(units):
+        a.spend.check()   # stopped early: partial file stays for the next run
+    recs = [done[u.id] for u in units]
     total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     for r in recs:
         for k in total:
@@ -163,6 +203,7 @@ def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
             "cost_usd": cost_usd(cfg.model, total),
             "finished": datetime.now().isoformat()}
     write_json(path, data)
+    part.unlink(missing_ok=True)
     return data
 
 
@@ -175,11 +216,27 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     findings = [f for u in audit["units"] for f in u["findings"]]
     log(f"  validating {len(findings)} finding(s) with {vcfg.name()}")
     t0 = time.monotonic()
+    part = out_dir / f"{vcfg.name()}.partial.jsonl"
+    done = {e["i"]: e["rec"] for e in read_jsonl(part)}
+    unit_files = {u["unit"]: u["targets"] for u in audit["units"]}
+    lock = threading.Lock()
+
+    def one(i):
+        if a.spend.exceeded:
+            return
+        rec = validate_one(backend, ws, dict(findings[i]), vcfg, cfg.threat_model,
+                           unit_files.get(findings[i].get("unit")))
+        a.spend.add(cost_usd(cfg.model, rec["usage"]))
+        with lock:
+            append_jsonl(part, {"i": i, "rec": rec})
+            done[i] = rec
+
+    todo = [i for i in range(len(findings)) if i not in done]
     with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
-        unit_files = {u["unit"]: u["targets"] for u in audit["units"]}
-        recs = list(pool.map(lambda f: validate_one(
-            backend, ws, dict(f), vcfg, cfg.threat_model, unit_files.get(f.get("unit"))),
-            findings))
+        list(pool.map(one, todo))
+    if len(done) < len(findings):
+        a.spend.check()   # stopped early: partial file stays for the next run
+    recs = [done[i] for i in range(len(findings))]
     total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     for r in recs:
         for k in total:
@@ -187,6 +244,7 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     write_json(path, {"validation": vcfg.as_dict(), "records": recs, "usage": total,
                       "cost_usd": cost_usd(cfg.model, total),
                       "wall_seconds": round(time.monotonic() - t0, 2)})
+    part.unlink(missing_ok=True)
 
 
 def main():
@@ -223,7 +281,11 @@ def main():
     ap.add_argument("--out", default=None, help="results dir; reuse it to resume")
     ap.add_argument("--dry-run", action="store_true", help="show the plan, call nothing")
     ap.add_argument("--skip-preflight", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--max-usd", type=float, default=None,
+                    help="stop starting new work once this invocation has spent this "
+                         "many dollars; finished work is saved and resumable")
     a = ap.parse_args()
+    a.spend = Budget(a.max_usd)
 
     labels = json.loads(Path(a.labels).read_text())
     ws = Workspace(a.repo)
@@ -293,21 +355,26 @@ def main():
         except Exception as e:
             print(f"  ! semgrep baseline failed: {e}")
 
-    for c in cells:
-        for k in range(1, a.runs + 1):
-            d = out / safe(c["model"]) / c["audit"].cell() / f"run{k}"
-            print(f"\n=== {c['model']} {c['audit'].cell()} run {k}/{a.runs} ===",
-                  flush=True)
-            try:
-                audit = run_audit_pass(c, k, ws, units, d, a,
-                                       lambda m: print(m, flush=True))
-            except FatalBackendError as e:
-                sys.exit(f"\nstopping: {e}\nnothing was saved for this pass; fix it "
-                         f"and rerun with --out {out} to resume")
-            for vcfg in c["validations"].values():
-                run_validation(c, audit, vcfg, ws, d, a, lambda m: print(m, flush=True))
+    log = lambda m: print(m, flush=True)  # noqa: E731
+    try:
+        for c in cells:
+            for k in range(1, a.runs + 1):
+                d = out / safe(c["model"]) / c["audit"].cell() / f"run{k}"
+                print(f"\n=== {c['model']} {c['audit'].cell()} run {k}/{a.runs} ===",
+                      flush=True)
+                a.spend.check()
+                audit = run_audit_pass(c, k, ws, units, d, a, log)
+                for vcfg in c["validations"].values():
+                    run_validation(c, audit, vcfg, ws, d, a, log)
+    except BudgetExceeded as e:
+        sys.exit(f"\nbudget reached: {e}\nfinished work is saved; rerun with "
+                 f"--out {out} (and a new --max-usd) to continue where this stopped")
+    except FatalBackendError as e:
+        sys.exit(f"\nstopping: {e}\nfinished units are saved; fix it and rerun "
+                 f"with --out {out} to resume")
 
-    print(f"\ndone. results in {out}\nscore them (free): python eval/report.py {out}")
+    print(f"\ndone. {a.spend.summary()}\nresults in {out}\n"
+          f"score them (free): python eval/report.py {out}")
 
 
 if __name__ == "__main__":

@@ -83,24 +83,36 @@ class Auditor:
 
     # ------------------------------------------------------------ public
 
-    def run_units(self, units: list[Unit], workers: int = 1, log=print) -> list[dict]:
+    def run_units(self, units: list[Unit], workers: int = 1, log=print,
+                  on_done=None, should_stop=None) -> list[dict]:
+        """Run every unit; returns records in unit order. on_done(rec) is called
+        as each unit finishes (for checkpointing and budget). Once should_stop()
+        is true, units that haven't started are skipped and left out."""
         if self.cfg.static_analysis:
             # one scan up front, so worker threads share the cache instead of racing
             try:
                 self.ws.semgrep_results(".", self.cfg.semgrep_config)
             except Exception as e:
                 log(f"  ! semgrep unavailable: {e}")
+
+        def one(u, i):
+            if should_stop is not None and should_stop():
+                return None
+            rec = self._run_logged(u, i, len(units), log)
+            if on_done is not None:
+                on_done(rec)
+            return rec
+
         out: list[dict | None] = [None] * len(units)
         if workers <= 1:
             for i, u in enumerate(units):
-                out[i] = self._run_logged(u, i, len(units), log)
+                out[i] = one(u, i)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futs = {pool.submit(self._run_logged, u, i, len(units), log): i
-                        for i, u in enumerate(units)}
+                futs = {pool.submit(one, u, i): i for i, u in enumerate(units)}
                 for fut in as_completed(futs):
                     out[futs[fut]] = fut.result()
-        return out  # type: ignore[return-value]
+        return [r for r in out if r is not None]
 
     def run_unit(self, unit: Unit) -> dict:
         rec = _new_record(unit)

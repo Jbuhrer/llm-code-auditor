@@ -175,3 +175,43 @@ def test_validator_sees_whole_unit_not_a_window(tmp_path):
     rec = validate_one(FakeBackend(script), ws, f, ValidationConfig(True, (), window=5,
                        context_budget=50), "all-external", ["X_66a.java", "X_66b.java"])
     assert rec["window_fallback"] and "exec(data)" in seen[1]
+
+
+def test_budget_cap_stops_saves_and_resumes(tmp_path, monkeypatch):
+    import json
+    import sys
+    import eval.experiment as ex
+    from tests.conftest import report
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for n in ("a", "b", "c"):
+        (repo / f"{n}.py").write_text("x = 1\n")
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps([{"file": "a.py", "line": 1, "bug_class": "sqli"}]))
+    out = tmp_path / "res"
+    calls = []
+
+    def backend(*_a, **_k):
+        def script(conv):
+            calls.append(1)
+            return report([])   # 100 in / 20 out on opus = $0.0008 per unit
+        return FakeBackend(script)
+
+    monkeypatch.setattr(ex, "make_backend", backend)
+    base = ["experiment.py", str(repo), str(labels), "--configs", "C0", "--runs", "1",
+            "--unit", "file", "--no-baseline", "--workers", "1", "--skip-preflight",
+            "--out", str(out)]
+    monkeypatch.setattr(sys, "argv", base + ["--max-usd", "0.001"])
+    with pytest.raises(SystemExit) as e:
+        ex.main()
+    assert "budget reached" in str(e.value)
+    run = out / "claude-opus-5-5" / "fixed-nosa" / "run1"
+    assert not (run / "audit.json").exists()
+    assert len((run / "audit.partial.jsonl").read_text().splitlines()) == 2
+    assert len(calls) == 2
+
+    monkeypatch.setattr(sys, "argv", base)   # resume, no cap
+    ex.main()
+    assert len(calls) == 3                   # only the unfinished unit was paid for
+    assert len(json.loads((run / "audit.json").read_text())["units"]) == 3
+    assert not (run / "audit.partial.jsonl").exists()
