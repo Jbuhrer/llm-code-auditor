@@ -1,136 +1,131 @@
-# Architecture: LLM Code-Auditing Agent
+# Architecture
 
-A one-page reference for the system, based on the design of RepoAudit
-(Guo et al., ICML 2025, arXiv:2501.18160) and IRIS (Li et al., ICLR 2025,
-arXiv:2405.17238), adapted to a masters-scope build.
+The system is plumbing; the contribution is the measurement. Everything here
+exists so the four factors (tool access, exploration, validation, model) can vary
+independently while the benchmark, prompt structure, and scoring stay fixed.
 
-## The reference design (RepoAudit)
+## Lineage
 
-RepoAudit is a multi-agent, neuro-symbolic framework. The parts that matter:
+The first version was `research.py` in PenAgent: send each line-numbered file to
+the model with a bug-hunting prompt and parse JSON findings. The problem (advisor
+feedback): an auditor that sees one file at a time can't look up a callee, check
+a sanitizer definition, or run a tool, so it tests the model under artificial
+handicaps. That setup survives here only as C0, the model-only control.
 
-1. **MetaScanAgent** parses the repo with tree-sitter (compilation-free) to get
-   the syntactic map: functions, call graph, where things are defined.
-2. **DFBScanAgent** does inter-procedural data-flow analysis on demand. It walks
-   data-flow facts along feasible paths inside functions, following a source
-   (where untrusted data enters) toward a sink (where it is dangerously used).
-   Agent memory lets it explore only what it needs instead of loading the whole
-   repo, which is what keeps token cost bounded on large projects.
-3. **Validator module** re-checks each candidate: it verifies the data-flow
-   facts and tests whether the path conditions are actually satisfiable. This is
-   the main false-positive killer. It is why RepoAudit reports ~78% precision
-   where naive file-by-file LLM auditing does far worse.
+The design follows:
 
-Key properties: compilation-free, multi-lingual (C/C++, Java, Python, Go), and
-LLM output is treated as a *hypothesis* that a cheaper symbolic check confirms,
-not as a final answer.
+- **RepoAudit** (arXiv:2501.18160): the agent explores on demand instead of
+  loading the repo, and a validator re-checks each candidate's data-flow facts
+  and path feasibility. Here: `exploration="explore"` and `validate.py`.
+- **IRIS** (arXiv:2405.17238): static analysis enumerates candidates and the LLM
+  triages. Here: `static_analysis=True` (semgrep now, CodeQL later).
+- ReAct / SWE-agent tool loops, and Agentless as the reminder that a fixed
+  pipeline is a serious baseline (C0/C1).
 
-## How this scaffold maps to it
+## One audit cell
 
-This repo is a slimmed masters-scope version of that pattern:
+```
+units = build_units(repo, "file" | "testcase" | "repo")
+for each unit:
+    fixed:    pack target + related files up to context_budget
+              (+ semgrep hits if static_analysis) -> one call -> report_findings
+    explore:  pack target up to context_budget -> tool loop
+              list_dir / read_file / grep (+ run_semgrep if static_analysis)
+              every tool result is charged to the same context_budget
+              -> report_findings
+    record:   findings, tokens (incl. cache), dollars, seconds, turns,
+              truncation, budget exhaustion, refusals, errors
+```
 
-| RepoAudit concept        | Here                                             |
-|--------------------------|--------------------------------------------------|
-| MetaScan / on-demand nav | `tools.py` (list_dir, grep, read_file)           |
-| Independent symbolic sig | `tools.py::run_semgrep` (swap in CodeQL later)   |
-| Explore -> hypothesize   | `agent.py` tool-use loop + `prompts.py` system   |
-| Validator module         | `agent.py::_validate` + `prompts.py` VALIDATOR   |
-| Common output format     | `sarif.py` (normalize any tool's SARIF)          |
-| Strong baseline          | `baseline.py` (semgrep now, ToB skills later)    |
-| Reproducible scoring     | `eval/metrics.py`, `run_benchmark.py`, `experiment.py` |
+**Matched budgets.** Both modes get the same budget of code-context tokens per
+unit, measured with one estimator (`units.est_tokens`). Fixed mode spends it up
+front on the target plus files it mentions, then same-directory files. Explore
+mode gets the target up front and spends the rest through tools; output past the
+budget is cut and the agent is told to report. Total billed tokens (which differ,
+since a loop resends history) are logged separately for RO3.
 
-The agent explores through tools instead of being handed the whole codebase.
-It forms source->sink hypotheses, corroborates with semgrep, then a second
-independent validation pass drops anything it cannot confirm.
+**Units.** `testcase` keeps Juliet's split cases (`_51a/_51b`, the `_81` family)
+in one conversation so cross-function and cross-file flaws stay auditable.
+Findings whose sink is outside the unit's targets are dropped (and counted),
+since another unit owns that file.
 
-## Where the actual research lives
+## Validation (RO2)
 
-The system is plumbing. The contribution your advisor wants is the measured
-iteration on it:
+Runs as a post-pass on the raw findings of an audit cell, one independent call
+per finding. The validator sees the finding's whole file plus the rest of its
+audit unit (up to `ValidationConfig.context_budget`), so on split cases it can
+see the source in the other file. A 60-line window around the sink is only the
+fallback for oversized files. Evidence items, any subset:
 
-- **Prompt / loop iteration** (`prompts.py`): each change scored on the same
-  benchmark for precision, false-positive rate, and token cost. Keep every
-  version so numbers are reproducible.
-- **Validator ablation**: run the benchmark with `--no-validate` vs with it.
-  The delta in false-positive rate is a clean, defensible result.
-- **Cost/latency tuning**: tokens and turns per project are logged in
-  `AuditResult`. Show you cut cost without losing recall.
-- **Real bugs**: point it at real open-source projects and triage what it finds.
-  Even one confirmed, reproducible bug (reported and acknowledged upstream) is a
-  strong masters result and mirrors how RepoAudit validated.
+| item | model must give | mechanical check |
+|---|---|---|
+| path | steps of `{file, line, quote}` | every quote must appear within 2 lines of its cited line |
+| sanitizer | sanitizers + `sanitizer_adequate` | adequate sanitizer -> reject |
+| conditions | path conditions + `conditions_satisfiable` | unsatisfiable -> reject |
+| poc | a concrete input | empty -> reject |
 
-## Baseline: Trail of Bits skills
+`rejected_by` on each record says which checks failed, which is what the RO2
+table counts. With no items, the validator is a plain confirmed/rejected verdict.
 
-Trail of Bits publishes a Claude Code skills marketplace (github.com/trailofbits/skills)
-that already implements the agent-plus-tools auditing pattern professionally.
-Two skills overlap directly with this build: `static-analysis` (CodeQL + Semgrep
-+ SARIF) and `fp-check` (systematic false-positive verification with gate
-reviews, which is their version of the validator pass here).
+## Threat model
 
-This matters for the research framing. Since ToB ships the plumbing, "I built an
-auditing agent" is not by itself a contribution. The contribution is the rigorous
-evaluation they do NOT publish: precision / recall / FP-rate / token-cost across
-public benchmarks, with the ToB skills (and plain semgrep) as the baseline you
-measure against. `baseline.py` + `sarif.py` exist so a ToB skill, run via Claude
-Code to emit SARIF, drops into the same scoring harness as your agent. Beating a
-strong, real baseline on the same ground truth is far more defensible than
-comparing against nothing.
+Every prompt, hunter and validator, states who the attacker is
+(`AuditConfig.threat_model`). `all-external` treats every outside input (env
+vars, properties, config and data files, console, DB rows, network) as tainted,
+which is what Juliet's ground truth assumes. `remote` is a realistic remote
+attacker, the default for `run_audit.py` on real repos. Without this, models
+picked their own threat model: in the pilot, Haiku and Sonnet called env vars,
+config files, console input and DB rows trusted and rejected real Juliet bugs.
 
-Note on toy-benchmark results: semgrep with pinned local rules catches the
-command-injection bug but misses the SQL-injection whose two-line shape does not
-match the rule (precision 1.0, recall 0.5). That recall gap is the whole point:
-static analysis is precise but brittle, and the agent's job is to raise recall
-while the validator holds precision. That gap is what your numbers should show
-the agent closing.
+## Models
 
-## Adapted from Trail of Bits skills
+`llm.py` hides the provider. Claude models run with native tool use, prompt
+caching on multi-turn loops, and a fixed `effort` level (current Claude models
+reject `temperature`, so effort is the held-constant sampling setting). Refusals
+(`stop_reason: refusal`) are recorded per unit; there is deliberately no
+automatic fallback to another model, since that would contaminate the model
+factor. Open-weight models go through any OpenAI-compatible server with a fixed
+temperature.
 
-Three ideas from github.com/trailofbits/skills are adapted here to improve
-real-world bug finding (all optional, all ablatable in `experiment.py`):
+## Scoring and statistics
 
-- **Context-building phase** (`context.py`, from `audit-context-building`): a
-  pre-pass that maps entry points, trust boundaries, sinks, persistent state, and
-  the highest-weight functions, then injects that map into the hunt. On real
-  repos this is what lets the agent follow input across functions instead of
-  guessing locally. Enable with `--context`.
-- **PoC-demanding validator** (`prompts.py::VALIDATOR_PROMPT`, from `fp-check`):
-  the validator now works in phases (claim, data flow, exploitability, negative
-  check) and confirms a finding ONLY if it can sketch a concrete proof-of-concept
-  that survives a negative check. This is a much stronger false-positive filter
-  than a yes/no on messy code.
-- **Variant hunting** (`variant.py`, from `variant-analysis`): after a finding is
-  confirmed, derive its sink pattern, grep the repo for siblings, and re-audit
-  those locations. One real bug usually has cousins, so this multiplies findings.
-  Enable with `--variants`.
+- `function` mode (Juliet): matched pairs. TP = right class in a bad-side
+  function; FP = right class in a good-side function. Verified against the full
+  Juliet Java manifest for CWE 78/89/23/36: all 3,972 flaw lines land in
+  bad-side functions.
+- `line` mode: path-level localization within 5 lines of a labelled sink.
+- Each cell runs R times. Tables report medians over runs with percentile
+  bootstrap CIs that resample test cases. Paired cells are compared with exact
+  McNemar on per-case majority outcomes, with odds ratio, Cohen's g, and risk
+  difference.
 
-Note on security hygiene (from Snyk's review of the skills ecosystem): treat any
-third-party skill as untrusted code and read its SKILL.md before running it. Here
-we reimplement the *ideas* in your own instrumented code, so nothing external is
-executed.
+## Reproducibility
 
-## Evaluation targets (public, reproducible)
+Every results folder records the git commit (with a dirty flag), prompt version
+and hash, semgrep version and ruleset, full configs, and raw token counts, so
+dollars can be recomputed if prices change. A results folder refuses to resume
+under different prompts. Pin `--semgrep-config` to a fixed ruleset for thesis
+runs: `auto` changes as the registry updates.
 
-- **NIST Juliet** — labelled good/bad pairs; ideal for precision and FP rate.
-- **CWE-Bench-Java** — github.com/iris-sast/cwe-bench-java; real projects, one
-  CVE each, what IRIS used.
-- **Real OSS repos** — the "find a few new bugs" bar; validation by upstream.
+## Baselines
 
-## Suggested build order
+- Semgrep tool-only (`baseline.py`, SARIF). Any SARIF-emitting tool, including
+  CodeQL and the Trail of Bits `static-analysis` skill, drops into the same
+  scorer through `sarif.py`.
+- Model-only: C0.
 
-1. Get the agent loop running on the toy benchmark (`benchmarks/toy`).
-2. Establish the semgrep baseline (`eval/experiment.py`, config `baseline`).
-3. Run the full experiment table (baseline vs agent vs agent+validator) so you
-   can see the deltas before tuning anything.
-4. Iterate the prompt with numbers in hand; log every run and keep old versions.
-5. Add ToB `static-analysis` / `fp-check` as a second baseline via Claude Code
-   (emit SARIF -> `sarif.py`).
-6. Scale to Juliet / CWE-Bench-Java, then a real repo, and try to surface a
-   confirmed new bug worth reporting upstream.
+## Not built yet
 
-## Key references
+- CWE-Bench-Java loader (IRIS's 120 real CVEs), reported separately from Juliet.
+- CodeQL as a second static-analysis tool.
+- RO4: semantics-preserving edits (SecLLMHolmes-style) and runs on current
+  versions of active open-source projects.
+- Chronological splits and contamination checks (PrimeVul, LessLeak-Bench) for
+  the real-CVE benchmark.
 
-- Trail of Bits skills: github.com/trailofbits/skills (baseline + prior art)
-- RepoAudit: arXiv:2501.18160 (code: github.com/PurCL/RepoAudit)
-- IRIS: arXiv:2405.17238 (benchmark: github.com/iris-sast/cwe-bench-java)
-- REVELIO / FuzzingBrain / VulnLLM-R: recent work on confirming LLM findings by
-  execution rather than static reasoning alone. The direction to cite if you
-  extend toward runtime confirmation.
+## Optional extras
+
+`context.py` (a context-building pre-pass) and `variant.py` (variant hunting
+after a confirmed bug), adapted from Trail of Bits skills, are available in
+`run_audit.py --context --variants` for real repos. They are not thesis factors
+and are not part of the presets.

@@ -1,4 +1,4 @@
 [
   {"file": "app.py", "line": 6, "bug_class": "sqli"},
-  {"file": "app.py", "line": 11, "bug_class": "cmdi"}
+  {"file": "app.py", "line": 10, "bug_class": "cmdi"}
 ]
