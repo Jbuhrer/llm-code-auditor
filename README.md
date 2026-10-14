@@ -1,213 +1,126 @@
-<div align="center">
+# llm-code-auditor
 
-<img src="penagent_logo.svg" width="300" alt="PenAgent Logo"/>
+An LLM agent for source-code security auditing, built as a measured evaluation:
+which parts of the agent scaffolding actually drive detection quality?
 
-# PenAgent
+Systems like IRIS and RepoAudit change several things at once, so nobody can say
+which component earns the gain. This repo isolates four factors and measures each
+one, holding the benchmark, prompt structure, and scoring constant:
 
-**Autonomous Penetration Testing Agent**
+| factor | toggle | values |
+|---|---|---|
+| tool access | `static_analysis` | semgrep on / off |
+| exploration | `exploration` | `explore` (agent navigates the repo) / `fixed` (context packed up front), same token budget |
+| validation | `ValidationConfig` | off, or an evidence stage requiring any subset of: path, sanitizer, conditions, poc |
+| model | `model` | any Claude model, or an open-weight model behind an OpenAI-compatible server |
 
-![Python](https://img.shields.io/badge/python-3.10+-blue?style=flat-square)
-![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
-![Status](https://img.shields.io/badge/status-research%20prototype-yellow?style=flat-square)
-![Target](https://img.shields.io/badge/use-authorized%20labs%20only-red?style=flat-square)
-![LLM](https://img.shields.io/badge/LLM-Claude%20Sonnet-purple?style=flat-square)
+## Configurations
 
-</div>
+| preset | exploration | static analysis | validation | what it is |
+|---|---|---|---|---|
+| C0 | fixed | off | off | model-only baseline (the old file-by-file prompting) |
+| C1 | fixed | on | off | + static analysis |
+| C2 | explore | off | off | + exploration instead |
+| C3 | explore | on | off | both |
+| C4 | explore | on | all evidence | full agent |
 
----
+C3 and C4 share one audit pass: the validator runs on exactly the same raw
+findings, so validation on/off is a paired comparison and the audit is paid once.
+`--factorial` adds every exploration x static-analysis x validation cell.
 
-> ⚠️ **Legal Notice:** PenAgent is a research prototype built for authorized lab environments only. All development and testing was performed against Metasploitable2 and HackTheBox lab targets. Unauthorized use against systems you do not own or have explicit written permission to test is illegal.
-
----
-
-## What is PenAgent?
-
-PenAgent is an agentic, retrieval-augmented LLM system that automates the full penetration testing workflow. Give it an nmap XML scan — it handles everything from there.
-
-```
-nmap -sV -Pn -oX scan.xml <target_ip>
-python3 main.py --scan scan.xml --output report.md --shell
-```
-
-```
- ____  ___  _  _    __    ___  ____  _  _  ____
-(  _ \( __)( \( )  /__\  / __)( ___)( \( )(_  _)
- ) __/ ) _)  ) \( /(__)\( (_ \ ) _)  ) \(  )(
-(____)(____)(_)\_)(__)(__)\___)(____)(_)\_)(__)
-
-◆ PHASE 1  PARSE       Loading scan.xml
-◆ PHASE 2  RETRIEVE    Querying RAG knowledge base + NVD CVE API
-◆ PHASE 3  EXECUTE     LangChain ReAct agent → Metasploit RPC
-  [+] Shell opened on 192.168.211.128:6200 — uid=0(root)
-◆ PHASE 4  REPORT      Writing findings to report.md
-
-  [+] ROOT SHELL ACQUIRED  192.168.211.128
-      uid=0(root) gid=0(root) groups=0(root)
-```
-
----
-
-## How It Works
-
-1. **Parse** — reads nmap XML into structured host/port/service/version data
-2. **Retrieve** — hybrid RAG (ChromaDB + BM25) searches 47,405 indexed chunks from PayloadsAllTheThings + ExploitDB, plus live NIST NVD CVE lookup
-3. **Execute** — LangChain ReAct agent autonomously calls Metasploit RPC, iterates until exploitation succeeds or exhausts options
-4. **Report** — Claude Sonnet synthesizes all findings into a professional pentest report with CVSS scores, CVE references, exploitation evidence, and remediation steps
-
----
-
-## Architecture
-
-```
-nmap XML
-   │
-   ▼
-parser.py              ← host / port / service / version extraction
-   │
-   ▼
-agent.py               ← LangChain ReAct agent (create_react_agent)
-   ├── tools/retriever.py     ← ChromaDB + BM25 hybrid RAG
-   ├── tools/cve_lookup.py    ← NIST NVD REST API v2.0
-   └── tools/msf_exec.py      ← pymetasploit3 → msfrpcd
-   │
-   ▼
-reporter.py            ← Claude Sonnet generates structured report
-   │
-   ▼
-report.md  +  optional root shell
-```
-
----
-
-## Tech Stack
-
-| Component        | Technology                                        |
-|------------------|---------------------------------------------------|
-| LLM              | Claude Sonnet 4 (Anthropic API)                   |
-| Agent framework  | LangChain ReAct (`create_react_agent`)            |
-| Vector store     | ChromaDB                                          |
-| Keyword search   | BM25 (hybrid retrieval)                           |
-| Embeddings       | `sentence-transformers/all-MiniLM-L6-v2`          |
-| Exploitation     | `pymetasploit3` → `msfrpcd` RPC daemon            |
-| CVE lookup       | NIST NVD REST API v2.0                            |
-| CLI interface    | `rich` (styled terminal output)                   |
-| Knowledge base   | PayloadsAllTheThings + ExploitDB (47,405 chunks)  |
-
----
-
-## Installation
-
-### Prerequisites
-- Kali Linux (or Debian-based with Metasploit installed)
-- Python 3.10+
-- Metasploit Framework
-- Anthropic API key
-
-### Setup
+## Setup
 
 ```bash
-git clone https://github.com/Jbuhrer/PenAgent.git
-cd PenAgent
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+python -m venv venv
+venv/Scripts/python -m pip install -r requirements.txt     # Windows
+export ANTHROPIC_API_KEY=...
+venv/Scripts/python -m pytest                               # offline, no API calls
 ```
 
-### Configure environment
+Semgrep installs from pip and runs natively on Windows. Open-weight models also
+need `pip install openai` and a server such as Ollama
+(`OPENAI_COMPAT_BASE_URL`, default `http://localhost:11434/v1`), then pass
+`--models openai-compat:<model-name>`.
 
-```bash
-cp .env.example .env
-# Edit .env and fill in your values
-```
+## Running the experiment
 
-```env
-ANTHROPIC_API_KEY=sk-ant-...
-MSF_PASSWORD=yourpassword
-MSF_HOST=127.0.0.1
-MSF_PORT=55553
-```
+1. Build a Juliet slice (download Juliet Java 1.3 from NIST SARD first):
 
-### Build the knowledge base
+   ```bash
+   python benchmarks/juliet_loader.py --juliet-dir ~/juliet-java/Java \
+       --cwes 89 78 22 --per-cwe 20 --seed 0
+   ```
 
-```bash
-python3 build_index.py
-```
+   Sampling is stratified by CWE and by whether the bad path crosses a function
+   boundary, and rotates across Juliet's source variants. CWE 22 means 23 + 36,
+   since Juliet Java has no CWE-22 folder.
 
-### Start Metasploit RPC daemon
+2. Look at the plan and cost before spending anything:
 
-```bash
-msfrpcd -P yourpassword -S -f
-```
+   ```bash
+   python eval/experiment.py benchmarks/juliet_slice benchmarks/juliet_slice/labels.json \
+       --models claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 --runs 3 --dry-run
+   ```
 
----
+3. Smoke test on a few units, then the real run:
 
-## Usage
+   ```bash
+   python eval/experiment.py ... --limit 3 --runs 1 --out results/smoke
+   python eval/experiment.py ... --runs 3 --evidence-sweep --out results/juliet-v1
+   ```
 
-```bash
-# Scan target
-nmap -sV -Pn -oX scan.xml <target_ip>
+   Results are saved as they finish. Rerunning with the same `--out` skips
+   finished work, so a crash or Ctrl-C never re-bills anything. Auth errors and
+   unknown model ids stop the run immediately instead of failing every unit.
 
-# Run PenAgent
-python3 main.py --scan scan.xml --output report.md --shell
-```
+4. Score and tabulate (free):
 
-### Flags
+   ```bash
+   python eval/report.py results/juliet-v1
+   ```
 
-| Flag            | Description                                         |
-|-----------------|-----------------------------------------------------|
-| `--scan`        | Path to nmap XML file (required)                    |
-| `--output`      | Output report filename (default: `report.md`)       |
-| `--shell`       | Drop into interactive shell after exploitation      |
-| `--shell-port`  | Manually specify shell port (overrides auto-detect) |
+   Writes `report.md` and `report.json`: the ablation table (medians over runs
+   with 95% bootstrap CIs over test cases), exact McNemar tests with effect sizes
+   between adjacent presets, the RO2 validator table (FPs removed vs TPs lost,
+   tokens per FP removed, which check rejected what), and cost per true positive.
 
----
+For a single real repo with no labels: `python run_audit.py /path/to/repo`
+(defaults to C4; `--exhaustive` hunts any vulnerability class).
 
-## Results
+## Scoring
 
-Tested against Metasploitable2 (Linux) and HackTheBox Archetype (Windows/MSSQL):
+Juliet puts each test case's vulnerable path and its patched twins in the same
+file. `function` scoring (the Juliet default) finds the function each finding
+sits in: the right class inside `bad`/`badSink` is a true positive, the right
+class inside `goodG2B`/`goodB2G` is a false positive on the patched variant.
+`line` scoring (path-level: right file, class, and sink line within 5) is used
+for localization and for non-Juliet benchmarks. Benchmarks are reported
+separately, never averaged together.
 
-| Target          | Time     | Findings | Shell          |
-|-----------------|----------|----------|----------------|
-| Metasploitable2 | ~3.5 min | 9        | root@metasploitable |
-| HTB Archetype   | ~4 min   | 3        | NT AUTHORITY\SYSTEM |
-
-Compared against PentestGPT (USENIX 2024): both achieved root on Metasploitable2, but PentestGPT produced only a CTF-style summary vs. PenAgent's structured professional report with CVSS scores, CVE references, and remediation guidance.
-
----
-
-## Project Structure
+## Layout
 
 ```
-PenAgent/
-├── main.py              ← CLI entry point
-├── banner.py            ← Terminal UI (rich)
-├── parser.py            ← nmap XML parser
-├── agent.py             ← LangChain ReAct agent
-├── reporter.py          ← Claude report generator
-├── build_index.py       ← Knowledge base builder
-├── tools/
-│   ├── retriever.py     ← ChromaDB + BM25 hybrid search
-│   ├── cve_lookup.py    ← NIST NVD API
-│   └── msf_exec.py      ← Metasploit RPC
-├── .env.example
-├── requirements.txt
-└── README.md
+auditor/
+  config.py     the four factors, presets C0-C4, validation variants
+  agent.py      explore loop and fixed-context mode, per-unit run records
+  llm.py        Anthropic and OpenAI-compatible backends behind one interface
+  units.py      audit units (file / testcase / repo) and budget-matched packing
+  validate.py   evidence-stage validator with mechanical quote checking
+  tools.py      sandboxed list_dir / read_file / grep / run_semgrep
+  prompts.py    shared prompt core plus per-mode sections (versioned, hashed)
+  pricing.py    dollars per call
+  baseline.py, sarif.py    semgrep tool-only baseline via SARIF
+  context.py, variant.py   optional extras for real repos (not factors)
+eval/
+  experiment.py   configs x models x runs, resumable
+  report.py       tables, CIs, McNemar, RO2, RO3
+  metrics.py      function / line / testcase scoring
+  juliet_functions.py   compiler-free function spans for Juliet files
+  stats.py        bootstrap and exact McNemar, pure Python
+benchmarks/
+  juliet_loader.py, toy/
+tests/            offline tests with a scripted fake model
 ```
 
----
-
-## References
-
-- Yao et al. (2023). ReAct: Synergizing Reasoning and Acting in Language Models. ICLR.
-- Lewis et al. (2020). Retrieval-Augmented Generation for NLP Tasks. NeurIPS.
-- Deng et al. (2023). PentestGPT: An LLM-Empowered Automatic Penetration Testing Tool. arXiv:2308.06782.
-- NIST NVD: https://nvd.nist.gov
-- PayloadsAllTheThings: https://github.com/swisskyrepo/PayloadsAllTheThings
-
----
-
-## License
-
-MIT
-
-*Built for CSC 7644 (LLM Application Development) — Louisiana State University*
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and how it maps to
+RepoAudit and IRIS.

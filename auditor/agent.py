@@ -1,217 +1,334 @@
 """
-The auditing agent: an Anthropic native tool-use loop.
+The auditing agent.
 
-Design mirrors RepoAudit (arXiv:2501.18160):
-  explore -> hypothesize (source->sink) -> corroborate (semgrep) -> validate.
+One Auditor runs one audit cell (an AuditConfig) over a list of units and returns
+one record per unit. What changes between cells:
 
-Audits ONE FILE PER CONVERSATION by default and aggregates the findings. This is
-how real auditors (and RepoAudit) work: it keeps every request bounded, makes
-token cost scale linearly and predictably with repo size, and stops one large or
-malformed file from sinking the whole run. Whole-repo-in-one-context does not
-scale past a handful of files, so per-file is the default.
+  exploration="explore"  tool-use loop: the agent reads/greps the repo on demand,
+                         with tool output charged against context_budget
+  exploration="fixed"    one call: target + related files packed up front to the
+                         same context_budget, no tools except report_findings
+  static_analysis        explore: run_semgrep is in the toolset
+                         fixed: semgrep hits for the unit are in the prompt
 
-Token accounting is built in so every prompt/loop change can be scored on cost.
+Every unit record carries tokens (incl. cache reads/writes), dollars, wall time,
+turns, refusals and errors, so cost and failures are visible per cell (RO3).
 """
 from __future__ import annotations
 import json
-from dataclasses import dataclass, field, asdict
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
 
-import anthropic
+from .config import AuditConfig
+from .llm import empty_usage, add_usage
+from .pricing import cost_usd
+from .prompts import system_prompt, unit_task, VARIANT_PROMPT
+from .tools import Workspace, tool_schemas, dispatch, REPORT_TOOL
+from .units import Unit, build_units, pack_context, semgrep_block, est_tokens, CHARS_PER_TOKEN
+from .validate import resolve_file
 
-from .tools import Workspace, TOOL_SCHEMAS, dispatch
-from .prompts import system_prompt, VALIDATOR_PROMPT, VARIANT_PROMPT
-from .context import build_context
-from .variant import find_variants
+MAX_TOKENS = 16000   # per model call; thinking models need headroom
 
-MODEL = "claude-sonnet-4-6"  # cheap+capable for the explore loop; bump for hard repos
-REQUEST_TIMEOUT = 120  # seconds per API call; a hung call fails its file, not the run
-MAX_RETRIES = 2        # transient errors (overload/timeout) are retried this many times
+# Errors that will hit every unit the same way (bad key, no access, unknown model
+# id). These stop the pass instead of being recorded per unit, so a typo can't
+# produce a results folder full of identical failures.
+FATAL_ERRORS = {"AuthenticationError", "PermissionDeniedError", "NotFoundError"}
+
+
+class FatalBackendError(RuntimeError):
+    pass
 
 
 @dataclass
 class AuditResult:
+    """Aggregate over units, kept for run_audit.py and older callers."""
     findings: list[dict] = field(default_factory=list)
-    input_tokens: int = 0
-    output_tokens: int = 0
+    raw_findings: list[dict] = field(default_factory=list)
+    usage: dict = field(default_factory=empty_usage)
+    cost_usd: float | None = 0.0
+    seconds: float = 0.0
     turns: int = 0
-    files_audited: int = 0
-    raw_findings: list[dict] = field(default_factory=list)  # pre-validation
+    units: int = 0
+    refusals: int = 0
+    errors: int = 0
 
-    def as_dict(self):
-        return asdict(self)
+    @property
+    def input_tokens(self):
+        u = self.usage
+        return u["input"] + u["cache_read"] + u["cache_write"]
+
+    @property
+    def output_tokens(self):
+        return self.usage["output"]
+
+
+def _new_record(unit: Unit) -> dict:
+    return {"unit": unit.id, "targets": unit.targets, "findings": [],
+            "dropped_out_of_target": 0, "reported": False, "usage": empty_usage(),
+            "cost_usd": 0.0, "seconds": 0.0, "turns": 0, "context_tokens": 0,
+            "context_truncated": False, "budget_exhausted": False,
+            "refused": False, "error": None, "semgrep_error": None}
 
 
 class Auditor:
-    def __init__(self, repo_root: str, bug_classes: list[str], max_turns: int = 12,
-                 validate: bool = True, use_context: bool = False,
-                 use_variants: bool = False, model: str = MODEL):
-        self.ws = Workspace(repo_root)
-        self.bug_classes = bug_classes
-        # max_turns is now PER FILE (each file is a fresh, short conversation)
-        self.max_turns = max_turns
-        self.validate = validate
-        self.use_context = use_context      # ToB audit-context-building pre-pass
-        self.use_variants = use_variants    # ToB variant-analysis post-pass
-        self.model = model
-        # timeout + retries so one slow/hung request can't freeze a long run
-        self.client = anthropic.Anthropic(
-            timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES)
+    def __init__(self, ws: Workspace, cfg: AuditConfig, backend):
+        self.ws, self.cfg, self.backend = ws, cfg, backend
+        self.explore = cfg.exploration == "explore"
+        self.tools = tool_schemas(self.explore, cfg.static_analysis)
+        self.allowed = {t["name"] for t in self.tools}
+        self.system = system_prompt(list(cfg.bug_classes), self.explore,
+                                    cfg.static_analysis, cfg.context_budget,
+                                    cfg.threat_model)
 
-    def _call(self, **kwargs):
-        """One API call with usage accounting handled by the caller. Raises on
-        failure so callers can skip just the current file/finding."""
-        return self.client.messages.create(**kwargs)
+    # ------------------------------------------------------------ public
 
-    def run(self) -> AuditResult:
-        res = AuditResult()
-
-        # Optional architectural context, built once and shared across files.
-        context = ""
-        if self.use_context:
-            context = build_context(self.client, self.ws, self.model, res)
-
-        files = self.ws.source_files()
-        raw_findings: list[dict] = []
-        total = len(files)
-        for i, rel in enumerate(files, 1):
-            print(f"  auditing {i}/{total}: {rel}", flush=True)
-            hits = self._audit_file(rel, context, res)
-            if hits:
-                print(f"      -> {len(hits)} candidate(s)", flush=True)
-            raw_findings.extend(hits)
-            res.files_audited += 1
-
-        res.raw_findings = [dict(f) for f in raw_findings]  # keep a copy for analysis
-        if raw_findings and self.validate:
-            print(f"  validating {len(raw_findings)} candidate(s)...", flush=True)
-        findings = self._validate(raw_findings, res) if self.validate else raw_findings
-
-        if self.use_variants and findings:
-            findings = self._hunt_variants(findings, res)
-
-        res.findings = findings
-        return res
-
-    def _audit_file(self, rel: str, context: str, res: AuditResult) -> list[dict]:
-        """Audit a single file in its own fresh conversation. Bounded context,
-        so cost is predictable and one bad file can't take down the run."""
-        sys_prompt = system_prompt(self.bug_classes)
-        if context:
-            sys_prompt += "\n\n" + context + (
-                "\n\nUse this map to judge whether input reaching this file is "
-                "attacker-controlled.")
-
-        file_text = self.ws.read_file(rel, 1, 4000)
-        messages = [{
-            "role": "user",
-            "content": (
-                f"Audit ONLY this one file for the target bug classes: {rel}\n\n"
-                f"{file_text}\n\n"
-                "Trace whether attacker-controlled input reaches a dangerous sink "
-                "in this file. You may grep/read other files for context, but only "
-                "report findings whose sink is in this file. Call report_findings "
-                "once when done (empty list if nothing solid)."
-            ),
-        }]
-
-        found: list[dict] = []
-        for _ in range(self.max_turns):
-            res.turns += 1
+    def run_units(self, units: list[Unit], workers: int = 1, log=print) -> list[dict]:
+        if self.cfg.static_analysis:
+            # one scan up front, so worker threads share the cache instead of racing
             try:
-                resp = self.client.messages.create(
-                    model=self.model, max_tokens=2048,
-                    system=sys_prompt, tools=TOOL_SCHEMAS, messages=messages,
-                )
-            except Exception as e:  # one file failing must not kill the run
-                print(f"  ! {rel}: {str(e)[:120]}")
-                break
-            res.input_tokens += resp.usage.input_tokens
-            res.output_tokens += resp.usage.output_tokens
-            messages.append({"role": "assistant", "content": resp.content})
+                self.ws.semgrep_results(".", self.cfg.semgrep_config)
+            except Exception as e:
+                log(f"  ! semgrep unavailable: {e}")
+        out: list[dict | None] = [None] * len(units)
+        if workers <= 1:
+            for i, u in enumerate(units):
+                out[i] = self._run_logged(u, i, len(units), log)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {pool.submit(self._run_logged, u, i, len(units), log): i
+                        for i, u in enumerate(units)}
+                for fut in as_completed(futs):
+                    out[futs[fut]] = fut.result()
+        return out  # type: ignore[return-value]
 
-            tool_results, done = [], False
-            for block in resp.content:
-                if block.type != "tool_use":
-                    continue
-                if block.name == "report_findings":
-                    for f in block.input.get("findings", []):
-                        f.setdefault("file", rel)
-                        found.append(f)
+    def run_unit(self, unit: Unit) -> dict:
+        rec = _new_record(unit)
+        t0 = time.monotonic()
+        try:
+            if self.explore:
+                self._explore(unit, rec)
+            else:
+                self._fixed(unit, rec)
+        except Exception as e:  # one unit failing must not kill the run...
+            if type(e).__name__ in FATAL_ERRORS:   # ...unless it will fail them all
+                raise FatalBackendError(f"{type(e).__name__}: {str(e)[:300]}") from e
+            rec["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+        rec["seconds"] = round(time.monotonic() - t0, 2)
+        rec["cost_usd"] = cost_usd(self.cfg.model, rec["usage"])
+        rec["findings"] = self._normalize(unit, rec)
+        return rec
+
+    # ------------------------------------------------------------ modes
+
+    def _run_logged(self, unit, i, n, log):
+        rec = self.run_unit(unit)
+        tag = ("ERROR " + rec["error"][:80]) if rec["error"] else \
+              ("REFUSED" if rec["refused"] else f"{len(rec['findings'])} finding(s)")
+        log(f"  [{i + 1}/{n}] {unit.id}: {tag}")
+        return rec
+
+    def _step(self, conv, rec) -> object:
+        reply = conv.step(MAX_TOKENS)
+        rec["turns"] += 1
+        add_usage(rec["usage"], reply.usage)
+        if reply.stop_reason == "refusal":
+            rec["refused"] = True
+        return reply
+
+    def _collect(self, call, rec, unit) -> None:
+        rec["reported"] = True
+        found = call.input.get("findings", [])
+        if isinstance(found, list):
+            for f in found:
+                if isinstance(f, dict):
+                    f.setdefault("file", unit.targets[0] if unit.targets else "")
+                    rec["findings"].append(f)
+
+    def _fixed(self, unit: Unit, rec: dict) -> None:
+        text, used, _, trunc = pack_context(self.ws, unit, self.cfg.context_budget,
+                                            include_related=True)
+        rec["context_tokens"], rec["context_truncated"] = used, trunc
+        prompt = unit_task(unit.targets, explore=False) + "\n\n" + text
+        if self.cfg.static_analysis:
+            sg, err = semgrep_block(self.ws, unit.targets or self.ws.source_files(),
+                                    self.cfg.semgrep_config)
+            rec["semgrep_error"] = err
+            prompt += "\n\n" + sg
+        conv = self.backend.conversation(self.system, self.tools, cache=False)
+        conv.user(prompt)
+        for attempt in range(2):
+            reply = self._step(conv, rec)
+            if rec["refused"]:
+                return
+            calls = [c for c in reply.tool_calls if c.name == "report_findings"]
+            for c in calls:
+                self._collect(c, rec, unit)
+            if calls:
+                return
+            if reply.tool_calls:   # answer stray calls so the history stays valid
+                conv.tool_results([(c.id, "(not available)") for c in reply.tool_calls],
+                                  "Call report_findings now.")
+            else:
+                conv.user("Call report_findings now (empty list if nothing is solid).")
+
+    def _explore(self, unit: Unit, rec: dict) -> None:
+        budget = self.cfg.context_budget
+        text, used, _, trunc = pack_context(self.ws, unit, budget, include_related=False)
+        rec["context_tokens"], rec["context_truncated"] = used, trunc
+        conv = self.backend.conversation(self.system, self.tools, cache=True)
+        conv.user(unit_task(unit.targets, explore=True) + "\n\n" + text)
+
+        for turn in range(self.cfg.max_turns):
+            reply = self._step(conv, rec)
+            if rec["refused"]:
+                return
+            if not reply.tool_calls:
+                conv.user("Call report_findings now (empty list if nothing is solid).")
+                continue
+            results, done = [], False
+            for call in reply.tool_calls:
+                if call.name == "report_findings":
+                    self._collect(call, rec, unit)
+                    results.append((call.id, "received"))
                     done = True
-                    tool_results.append({"type": "tool_result",
-                                         "tool_use_id": block.id, "content": "received"})
-                else:
-                    out = dispatch(self.ws, block.name, block.input)
-                    tool_results.append({"type": "tool_result",
-                                         "tool_use_id": block.id, "content": out})
+                    continue
+                if rec["budget_exhausted"]:
+                    results.append((call.id, "(context budget exhausted: call "
+                                             "report_findings now)"))
+                    continue
+                out = dispatch(self.ws, call.name, call.input,
+                               self.cfg.semgrep_config, self.allowed)
+                cost = est_tokens(out)
+                if used + cost > budget:
+                    room = max(0, budget - used)
+                    out = out[:room * CHARS_PER_TOKEN] + (
+                        "\n... (context budget exhausted: output cut. Call "
+                        "report_findings now.)")
+                    rec["budget_exhausted"] = True
+                    cost = room
+                used += cost
+                results.append((call.id, out))
+            rec["context_tokens"] = used
             if done:
-                break
-            if not tool_results:
-                messages.append({"role": "user", "content":
-                                 "Call report_findings now (empty list if none)."})
-                continue
-            messages.append({"role": "user", "content": tool_results})
-        return found
+                return
+            note = None
+            if turn == self.cfg.max_turns - 2:
+                note = "This is your last turn. Call report_findings now."
+            conv.tool_results(results, note)
 
-    def _hunt_variants(self, findings: list[dict], res: AuditResult) -> list[dict]:
-        extra: list[dict] = []
-        seen = {(f.get("file"), f.get("line")) for f in findings}
-        for f in list(findings):
-            candidates = find_variants(self.ws, f)
-            if not candidates:
-                continue
+    # ------------------------------------------------------------ findings
+
+    def _normalize(self, unit: Unit, rec: dict) -> list[dict]:
+        """Resolve file paths to repo-relative, tag the unit, and drop findings
+        whose sink is outside the unit's targets (another unit owns that file)."""
+        out, tset = [], set(unit.targets)
+        for f in rec["findings"]:
+            f = dict(f)
+            resolved = resolve_file(self.ws, str(f.get("file", "")))
+            if resolved:
+                f["file"] = resolved
             try:
-                resp = self.client.messages.create(
-                    model=self.model, max_tokens=2048,
-                    system=system_prompt(self.bug_classes), tools=TOOL_SCHEMAS,
-                    messages=[{"role": "user", "content": VARIANT_PROMPT.format(
-                        finding=json.dumps(f), candidates="\n".join(candidates))}],
-                )
-            except Exception as e:
-                print(f"  ! variant hunt: {str(e)[:120]}")
+                f["line"] = int(f.get("line", -1))
+            except (TypeError, ValueError):
+                f["line"] = -1
+            f["unit"] = unit.id
+            if tset and f["file"] not in tset:
+                rec["dropped_out_of_target"] += 1
                 continue
-            res.input_tokens += resp.usage.input_tokens
-            res.output_tokens += resp.usage.output_tokens
-            res.turns += 1
-            for block in resp.content:
-                if block.type == "tool_use" and block.name == "report_findings":
-                    for nf in block.input.get("findings", []):
-                        key = (nf.get("file"), nf.get("line"))
-                        if key not in seen:
-                            nf["found_via"] = "variant-analysis"
-                            seen.add(key)
-                            extra.append(nf)
-        if self.validate and extra:
-            extra = self._validate(extra, res)
-        return findings + extra
+            out.append(f)
+        return out
 
-    def _validate(self, findings: list[dict], res: AuditResult) -> list[dict]:
-        confirmed = []
+
+# ---------------------------------------------------------------- extras
+# Used by run_audit.py for real repos. Not part of the factorial: context
+# building and variant hunting are separate, optional add-ons.
+
+def hunt_variants(backend, ws: Workspace, cfg: AuditConfig,
+                  findings: list[dict]) -> tuple[list[dict], dict]:
+    from .variant import find_variants
+    usage, extra = empty_usage(), []
+    seen = {(f.get("file"), f.get("line")) for f in findings}
+    system = system_prompt(list(cfg.bug_classes), True, cfg.static_analysis,
+                           cfg.context_budget, cfg.threat_model)
+    tools = tool_schemas(True, cfg.static_analysis)
+    for f in findings:
+        candidates = find_variants(ws, f)
+        if not candidates:
+            continue
+        try:
+            conv = backend.conversation(system, tools, cache=False)
+            conv.user(VARIANT_PROMPT.format(finding=json.dumps(f),
+                                            candidates="\n".join(candidates)))
+            reply = conv.step(MAX_TOKENS)
+        except Exception as e:
+            print(f"  ! variant hunt: {str(e)[:120]}")
+            continue
+        add_usage(usage, reply.usage)
+        for call in reply.tool_calls:
+            if call.name != "report_findings":
+                continue
+            for nf in call.input.get("findings", []):
+                key = (nf.get("file"), nf.get("line"))
+                if key not in seen:
+                    nf["found_via"] = "variant-analysis"
+                    seen.add(key)
+                    extra.append(nf)
+    return extra, usage
+
+
+def audit_repo(repo: str, cfg: AuditConfig, backend=None, workers: int = 1,
+               validation=None, use_context: bool = False,
+               use_variants: bool = False) -> AuditResult:
+    """Convenience wrapper: one cell over a whole repo, aggregated."""
+    from .llm import make_backend
+    from .validate import validate_one
+    from .context import build_context
+    backend = backend or make_backend(cfg.model, cfg.effort, cfg.temperature)
+    ws = Workspace(repo)
+    auditor = Auditor(ws, cfg, backend)
+    res = AuditResult()
+    t0 = time.monotonic()
+    if use_context:
+        ctx, u = build_context(backend, ws)
+        add_usage(res.usage, u)
+        if ctx:
+            auditor.system += "\n\n" + ctx + (
+                "\n\nUse this map to judge whether input reaching the target is "
+                "attacker-controlled.")
+    recs = auditor.run_units(build_units(ws, cfg.unit), workers)
+    for r in recs:
+        add_usage(res.usage, r["usage"])
+        res.turns += r["turns"]
+        res.refusals += r["refused"]
+        res.errors += bool(r["error"])
+        res.raw_findings += r["findings"]
+    res.units = len(recs)
+    findings = [dict(f) for f in res.raw_findings]
+    unit_files = {r["unit"]: r["targets"] for r in recs}
+    if validation is not None and validation.enabled:
+        kept = []
         for f in findings:
-            code = self.ws.read_file(
-                f.get("file", ""),
-                max(1, f.get("line", 1) - 30),
-                f.get("line", 1) + 30,
-            )
-            try:
-                resp = self.client.messages.create(
-                    model=self.model, max_tokens=400,
-                    messages=[{"role": "user", "content": VALIDATOR_PROMPT.format(
-                        finding=json.dumps(f), code=code)}],
-                )
-            except Exception as e:
-                print(f"  ! validate: {str(e)[:120]}")
-                continue
-            res.input_tokens += resp.usage.input_tokens
-            res.output_tokens += resp.usage.output_tokens
-            text = "".join(b.text for b in resp.content if b.type == "text")
-            text = text.replace("```json", "").replace("```", "").strip()
-            try:
-                verdict = json.loads(text)
-            except json.JSONDecodeError:
-                continue  # unparseable -> drop, keeps precision high
-            if verdict.get("verdict") == "confirmed":
-                f["confidence"] = verdict.get("adjusted_confidence", f.get("confidence"))
-                f["validator_reason"] = verdict.get("reason", "")
-                confirmed.append(f)
-        return confirmed
+            v = validate_one(backend, ws, f, validation, cfg.threat_model,
+                             unit_files.get(f.get("unit")))
+            add_usage(res.usage, v["usage"])
+            if v["confirmed"]:
+                f["validator_reason"] = (v["verdict"] or {}).get("reason", "")
+                kept.append(f)
+        findings = kept
+    if use_variants and findings:
+        extra, u = hunt_variants(backend, ws, cfg, findings)
+        add_usage(res.usage, u)
+        if validation is not None and validation.enabled:
+            kept = []
+            for f in extra:
+                v = validate_one(backend, ws, f, validation, cfg.threat_model)
+                add_usage(res.usage, v["usage"])
+                if v["confirmed"]:
+                    kept.append(f)
+            extra = kept
+        findings += extra
+    res.findings = findings
+    res.seconds = round(time.monotonic() - t0, 2)
+    res.cost_usd = cost_usd(cfg.model, res.usage)
+    return res

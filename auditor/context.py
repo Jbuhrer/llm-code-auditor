@@ -1,21 +1,18 @@
 """
 Context-building phase, adapted from Trail of Bits' audit-context-building skill.
 
-Runs BEFORE bug hunting. The agent maps entry points, trust boundaries, sinks,
-persistent state, and the highest-weight functions, then hands back a compact
-summary that gets injected into the hunt's system prompt. On real repos this is
-the difference between the agent guessing at a high level and actually following
-input from a source to a sink across functions.
-
-Kept token-bounded: it is a short, capped exploration that returns a summary
-string, not a full second audit.
+Optional add-on for real repos (run_audit.py --context), not one of the four
+thesis factors. Runs BEFORE bug hunting: the agent maps entry points, trust
+boundaries, sinks, persistent state, and the highest-weight functions, and the
+summary is appended to the hunt's system prompt.
 """
 from __future__ import annotations
 
-import anthropic
-
-from .tools import Workspace, TOOL_SCHEMAS, dispatch
+from .llm import empty_usage, add_usage
 from .prompts import CONTEXT_PROMPT
+from .tools import Workspace, EXPLORE_TOOLS, dispatch
+
+MAX_TOKENS = 16000
 
 # a report_context tool so the phase ends with a structured hand-back
 CONTEXT_TOOL = {
@@ -33,50 +30,36 @@ CONTEXT_TOOL = {
     },
 }
 
-# only the read-only exploration tools during context building (no reporting bugs)
-_EXPLORE_TOOLS = [t for t in TOOL_SCHEMAS if t["name"] in
-                  {"list_dir", "read_file", "grep", "run_semgrep"}] + [CONTEXT_TOOL]
 
-
-def build_context(client, ws: Workspace, model: str, res, max_turns: int = 15) -> str:
-    """Run the context pre-pass. Returns a summary string to prime the hunt.
-    Accumulates token usage into `res` (an AuditResult)."""
-    messages = [{
-        "role": "user",
-        "content": "Map this repository for a security audit. Start at the root.",
-    }]
-    summary = ""
+def build_context(backend, ws: Workspace, max_turns: int = 15) -> tuple[str, dict]:
+    """Run the context pre-pass. Returns (summary, usage). A failure returns an
+    empty summary so the hunt still runs."""
+    usage = empty_usage()
+    conv = backend.conversation(CONTEXT_PROMPT, EXPLORE_TOOLS + [CONTEXT_TOOL], cache=True)
+    conv.user("Map this repository for a security audit. Start at the root.")
     for _ in range(max_turns):
-        res.turns += 1
-        resp = client.messages.create(
-            model=model, max_tokens=1500,
-            system=CONTEXT_PROMPT, tools=_EXPLORE_TOOLS, messages=messages,
-        )
-        res.input_tokens += resp.usage.input_tokens
-        res.output_tokens += resp.usage.output_tokens
-        messages.append({"role": "assistant", "content": resp.content})
-
-        tool_results, done = [], False
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            if block.name == "report_context":
-                summary = _format_context(block.input)
-                done = True
-                tool_results.append({"type": "tool_result",
-                                     "tool_use_id": block.id, "content": "received"})
-            else:
-                out = dispatch(ws, block.name, block.input)
-                tool_results.append({"type": "tool_result",
-                                     "tool_use_id": block.id, "content": out})
-        if done:
-            break
-        if not tool_results:
-            messages.append({"role": "user",
-                             "content": "Call report_context with your summary now."})
+        try:
+            reply = conv.step(MAX_TOKENS)
+        except Exception as e:
+            print(f"  ! context build: {str(e)[:120]}")
+            return "", usage
+        add_usage(usage, reply.usage)
+        if reply.stop_reason == "refusal":
+            return "", usage
+        if not reply.tool_calls:
+            conv.user("Call report_context with your summary now.")
             continue
-        messages.append({"role": "user", "content": tool_results})
-    return summary
+        results, summary = [], None
+        for call in reply.tool_calls:
+            if call.name == "report_context":
+                summary = _format_context(call.input)
+                results.append((call.id, "received"))
+            else:
+                results.append((call.id, dispatch(ws, call.name, call.input)))
+        if summary is not None:
+            return summary, usage
+        conv.tool_results(results)
+    return "", usage
 
 
 def _format_context(ctx: dict) -> str:

@@ -1,2 +1,5 @@
-anthropic>=0.40.0
-semgrep>=1.90.0
+anthropic>=1.13.0
+semgrep>=1.180.0
+pytest>=8
+# optional, only for open-weight models behind an OpenAI-compatible server:
+# openai>=1.0

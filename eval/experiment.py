@@ -1,133 +1,313 @@
 #!/usr/bin/env python3
 """
-The experiment engine.
+The experiment engine: configs x models x repeated runs on one benchmark.
 
-Runs detector configurations against ONE labelled benchmark, prints a comparison
-table, and SAVES EVERY CONFIG'S FINDINGS so they can be analysed later for free
-(see eval/analyze.py). Nothing you pay for gets thrown away.
+  python eval/experiment.py <repo> <labels.json> --configs C0 C1 C2 C3 C4 \
+      --models claude-opus-5-5 claude-sonnet-5-5 claude-haiku-5-5 --runs 3
 
-Configurations:
-  baseline               - plain semgrep (state of practice, free)
-  agent                  - your agent, validator OFF
-  agent+validator        - your agent, validator ON
-  agent+context+variants - full ToB-adapted pipeline
+Cells that differ only in validation SHARE one audit pass (C3 and C4 do), so
+validation on/off is an exactly paired comparison and the audit is paid once.
 
-Cost saver + cleaner science: when `agent` and `agent+validator` are both
-requested, they SHARE ONE audit pass. The validator then runs on exactly the same
-candidates, so the two rows differ only by the validator (no run-to-run noise)
-and you pay for the audit once instead of twice.
+Everything is saved as it finishes, and finished pieces are skipped on rerun
+(pass the same --out), so a crash or Ctrl-C never re-bills completed work:
 
-Usage:
-  python eval/experiment.py benchmarks/mini benchmarks/mini/labels.json --bugs sqli cmdi
-  python eval/experiment.py <repo> <labels> --configs agent agent+validator
+  <out>/meta.json
+  <out>/<model>/<audit-cell>/run<k>/audit.json        per-unit records
+  <out>/<model>/<audit-cell>/run<k>/<val-variant>.json per-finding verdicts
+  <out>/baseline/semgrep.json                          tool-only baseline
 
-Output: results/<timestamp>/  with summary.json and one <config>.json per config.
+Then score and tabulate (free, no API calls):
+  python eval/report.py <out>
 """
+from __future__ import annotations
 import argparse
 import json
+import os
+import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from auditor import Auditor                     # noqa: E402
-from auditor.agent import AuditResult           # noqa: E402
-from auditor.baseline import semgrep_baseline   # noqa: E402
-from eval.metrics import score                  # noqa: E402
+from auditor.agent import Auditor, FatalBackendError                # noqa: E402
+from auditor.baseline import semgrep_baseline                       # noqa: E402
+from auditor.config import (AuditConfig, ValidationConfig, PRESETS,  # noqa: E402
+                            full_factorial, validation_variants, EVIDENCE)
+from auditor.llm import make_backend                                # noqa: E402
+from auditor.pricing import cost_usd                                # noqa: E402
+from auditor.prompts import PROMPT_VERSION, prompt_fingerprint, THREAT_MODELS  # noqa: E402
+from auditor.tools import Workspace, semgrep_exe                    # noqa: E402
+from auditor.units import build_units                               # noqa: E402
+from auditor.validate import validate_one                           # noqa: E402
+from eval.metrics import default_mode                               # noqa: E402
 
-ALL_CONFIGS = ["baseline", "agent", "agent+validator", "agent+context+variants"]
+EVIDENCE_SWEEP = ["plain", *EVIDENCE, "all"]
+
+
+def safe(name: str) -> str:
+    return name.replace(":", "_").replace("/", "_")
+
+
+def git_commit() -> str:
+    try:
+        root = Path(__file__).resolve().parent.parent
+        sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True,
+                             text=True).stdout.strip()
+        dirty = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                               capture_output=True, text=True).stdout.strip()
+        return sha + ("-dirty" if dirty else "")
+    except Exception:
+        return "unknown"
+
+
+def semgrep_version() -> str:
+    exe = semgrep_exe()
+    if not exe:
+        return "not installed"
+    try:
+        return subprocess.run([exe, "--version"], capture_output=True, text=True,
+                              timeout=120).stdout.strip()
+    except Exception as e:
+        return f"error: {e}"
+
+
+def preflight(models: list[str]) -> list[str]:
+    """Problems that would make every call fail, caught before spending anything."""
+    probs = []
+    claude = [m for m in models if not m.startswith("openai-compat:")]
+    if claude and not (os.environ.get("ANTHROPIC_API_KEY")
+                       or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+                       or os.environ.get("ANTHROPIC_PROFILE")):
+        probs.append("no Anthropic credentials: set ANTHROPIC_API_KEY (or log in with "
+                     "the ant CLI and set ANTHROPIC_PROFILE)")
+    if any(m.startswith("openai-compat:") for m in models):
+        try:
+            import openai  # noqa: F401
+        except ImportError:
+            probs.append("openai-compat models need: pip install openai")
+    return probs
+
+
+def write_json(path: Path, obj) -> None:
+    """Atomic write so an interrupted save never leaves a half file to 'resume'."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(obj, indent=2, default=str))
+    os.replace(tmp, path)
+
+
+def spread_limit(units, n: int):
+    """First n units, round-robin across CWEs (or top-level dirs), so a smoke
+    test with --limit covers every bug class instead of one alphabetical run."""
+    import re
+    groups: dict[str, list] = {}
+    for u in units:
+        m = re.search(r"CWE(\d+)_", u.id)
+        groups.setdefault(m.group(1) if m else u.id.split("/")[0], []).append(u)
+    queues, out = list(groups.values()), []
+    while len(out) < n and any(queues):
+        for q in queues:
+            if q and len(out) < n:
+                out.append(q.pop(0))
+    return out
+
+
+def plan_cells(a, base: AuditConfig) -> list[dict]:
+    """[{label, model, audit, validations:[ValidationConfig]}], audit passes merged."""
+    extra_vals = validation_variants(a.validation) if a.validation else []
+    if a.evidence_sweep:
+        extra_vals += validation_variants(EVIDENCE_SWEEP)
+    wanted = []   # (label, audit_cfg, val_cfg)
+    if a.factorial:
+        for cfg in full_factorial(base):
+            for v in [ValidationConfig(), ValidationConfig(True, tuple(EVIDENCE))]:
+                wanted.append((None, cfg, v))
+    for name in a.configs:
+        p = PRESETS[name]
+        cfg = replace(base, exploration=p.audit.exploration,
+                      static_analysis=p.audit.static_analysis)
+        wanted.append((name, cfg, p.validation))
+    cells: dict[tuple, dict] = {}
+    for model in a.models:
+        for label, cfg, val in wanted:
+            cfg = replace(cfg, model=model)
+            key = (model, cfg.cell())
+            cell = cells.setdefault(key, {"model": model, "audit": cfg, "labels": {},
+                                          "validations": {}})
+            for v in [val] + extra_vals:
+                if v.enabled:
+                    cell["validations"][v.name()] = v
+            if label:
+                cell["labels"][label] = val.name()
+    return list(cells.values())
+
+
+def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
+    path = out_dir / "audit.json"
+    if path.exists():
+        log(f"  (have {path}, skipping)")
+        return json.loads(path.read_text())
+    cfg: AuditConfig = cell["audit"]
+    backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
+    t0 = time.monotonic()
+    recs = Auditor(ws, cfg, backend).run_units(units, a.workers, log)
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    for r in recs:
+        for k in total:
+            total[k] += r["usage"].get(k, 0)
+    data = {"config": cfg.as_dict(), "run": run_k, "units": recs,
+            "wall_seconds": round(time.monotonic() - t0, 2), "usage": total,
+            "cost_usd": cost_usd(cfg.model, total),
+            "finished": datetime.now().isoformat()}
+    write_json(path, data)
+    return data
+
+
+def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> None:
+    path = out_dir / f"{vcfg.name()}.json"
+    if path.exists():
+        return
+    cfg: AuditConfig = cell["audit"]
+    backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
+    findings = [f for u in audit["units"] for f in u["findings"]]
+    log(f"  validating {len(findings)} finding(s) with {vcfg.name()}")
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
+        unit_files = {u["unit"]: u["targets"] for u in audit["units"]}
+        recs = list(pool.map(lambda f: validate_one(
+            backend, ws, dict(f), vcfg, cfg.threat_model, unit_files.get(f.get("unit"))),
+            findings))
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
+    for r in recs:
+        for k in total:
+            total[k] += r["usage"].get(k, 0)
+    write_json(path, {"validation": vcfg.as_dict(), "records": recs, "usage": total,
+                      "cost_usd": cost_usd(cfg.model, total),
+                      "wall_seconds": round(time.monotonic() - t0, 2)})
 
 
 def main():
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo")
     ap.add_argument("labels")
+    ap.add_argument("--configs", nargs="*", default=["C0", "C1", "C2", "C3", "C4"],
+                    choices=list(PRESETS))
+    ap.add_argument("--factorial", action="store_true",
+                    help="also run every exploration x static-analysis x validation cell")
+    ap.add_argument("--models", nargs="+", default=["claude-opus-5-5"])
+    ap.add_argument("--runs", type=int, default=3, help="independent repeats per cell")
+    ap.add_argument("--validation", nargs="*", default=[],
+                    help="extra validator variants on every audit cell: off, plain, "
+                         "all, or items joined by + (path, sanitizer, conditions, poc)")
+    ap.add_argument("--evidence-sweep", action="store_true",
+                    help="RO2: plain, each evidence item alone, and all")
+    ap.add_argument("--unit", choices=["file", "testcase", "repo"], default=None,
+                    help="default: testcase for Juliet labels, file otherwise")
+    ap.add_argument("--budget", type=int, default=24000, help="context tokens per unit")
+    ap.add_argument("--max-turns", type=int, default=15)
+    ap.add_argument("--effort", default="medium", help="Claude effort, held fixed")
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="open-weight backends only")
+    ap.add_argument("--semgrep-config", default="auto")
+    ap.add_argument("--threat-model", default="all-external", choices=list(THREAT_MODELS),
+                    help="who counts as the attacker; stated in every prompt "
+                         "(all-external matches Juliet's ground truth)")
     ap.add_argument("--bugs", nargs="+", default=["sqli", "cmdi", "path"])
-    ap.add_argument("--configs", nargs="+", default=["baseline", "agent", "agent+validator"],
-                    choices=ALL_CONFIGS)
-    ap.add_argument("--out", default=None, help="results dir (default results/<timestamp>)")
+    ap.add_argument("--workers", type=int, default=4, help="parallel units per pass")
+    ap.add_argument("--limit", type=int, default=None, help="first N units only (smoke tests)")
+    ap.add_argument("--no-baseline", action="store_true", help="skip the semgrep baseline")
+    ap.add_argument("--out", default=None, help="results dir; reuse it to resume")
+    ap.add_argument("--dry-run", action="store_true", help="show the plan, call nothing")
+    ap.add_argument("--skip-preflight", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
 
     labels = json.loads(Path(a.labels).read_text())
-    out_dir = Path(a.out or f"results/{datetime.now():%Y%m%d-%H%M%S}")
-    out_dir.mkdir(parents=True, exist_ok=True)
+    ws = Workspace(a.repo)
+    unit_mode = a.unit or ("testcase" if default_mode(labels) == "function" else "file")
+    units = build_units(ws, unit_mode)
+    if a.limit:
+        units = spread_limit(units, a.limit)
+    base = AuditConfig(context_budget=a.budget, max_turns=a.max_turns, effort=a.effort,
+                       temperature=a.temperature, semgrep_config=a.semgrep_config,
+                       threat_model=a.threat_model,
+                       unit=unit_mode, bug_classes=tuple(a.bugs))
+    cells = plan_cells(a, base)
 
-    rows: dict[str, dict] = {}
-    found: dict[str, list] = {}
+    print(f"{len(units)} unit(s) [{unit_mode}], {len(cells)} audit cell(s), "
+          f"{a.runs} run(s) each")
+    for c in cells:
+        vals = ", ".join(c["validations"]) or "none"
+        labels_s = ", ".join(f"{k}={v}" for k, v in c["labels"].items()) or "-"
+        print(f"  {c['model']:<22} {c['audit'].cell():<14} validators: {vals:<30} "
+              f"presets: {labels_s}")
+    passes = len(cells) * a.runs
+    print(f"{passes} audit pass(es) x {len(units)} unit(s) = {passes * len(units)} "
+          f"unit audits, plus validation calls per finding")
+    if a.dry_run:
+        return
+    probs = preflight(a.models)
+    if probs and not a.skip_preflight:
+        sys.exit("preflight failed:\n  " + "\n  ".join(probs))
 
-    def record(cfg, findings, cost):
-        s = score(findings, labels)
-        s.update(cost)
-        rows[cfg] = s
-        found[cfg] = findings
+    out = Path(a.out or f"results/{datetime.now():%Y%m%d-%H%M%S}")
+    out.mkdir(parents=True, exist_ok=True)
+    meta_path = out / "meta.json"
+    meta = {"repo": str(Path(a.repo).resolve()), "labels": str(Path(a.labels).resolve()),
+            "unit_mode": unit_mode, "n_units": len(units), "limit": a.limit,
+            "runs": a.runs, "models": a.models, "base_config": base.as_dict(),
+            "cells": [{"model": c["model"], "audit_cell": c["audit"].cell(),
+                       "audit": c["audit"].as_dict(), "labels": c["labels"],
+                       "validations": {k: v.as_dict() for k, v in c["validations"].items()}}
+                      for c in cells],
+            "prompt_version": PROMPT_VERSION, "prompt_hash": prompt_fingerprint(),
+            "semgrep": {"version": semgrep_version(), "config": a.semgrep_config},
+            "git": git_commit(), "started": datetime.now().isoformat()}
+    if meta_path.exists():
+        old = json.loads(meta_path.read_text())
+        if old.get("prompt_hash") != meta["prompt_hash"]:
+            sys.exit(f"{out} was started with different prompts "
+                     f"({old.get('prompt_hash')} vs {meta['prompt_hash']}); "
+                     "use a new --out so results don't mix")
+        old_cells = {(c["model"], c["audit_cell"]): c for c in old.get("cells", [])}
+        for c in meta["cells"]:   # keep validators and labels from earlier invocations
+            prev = old_cells.pop((c["model"], c["audit_cell"]), None)
+            if prev:
+                c["labels"] = {**prev.get("labels", {}), **c["labels"]}
+                c["validations"] = {**prev.get("validations", {}), **c["validations"]}
+        meta["cells"] += list(old_cells.values())
+        meta["runs"] = max(meta["runs"], old.get("runs", 0))
+        meta["started"] = old.get("started", meta["started"])
+    write_json(meta_path, meta)
 
-    # ---- baseline (free) ----
-    if "baseline" in a.configs:
-        print("\n=== running baseline ===", flush=True)
+    if not a.no_baseline and not (out / "baseline" / "semgrep.json").exists():
+        print("\n=== baseline: semgrep (tool only) ===", flush=True)
         try:
-            record("baseline", semgrep_baseline(a.repo), {"tokens": 0})
+            t0 = time.monotonic()
+            fs = semgrep_baseline(a.repo, a.semgrep_config)
+            write_json(out / "baseline" / "semgrep.json",
+                       {"findings": fs, "wall_seconds": round(time.monotonic() - t0, 2)})
         except Exception as e:
-            rows["baseline"] = {"error": str(e)}
+            print(f"  ! semgrep baseline failed: {e}")
 
-    # ---- agent and agent+validator share ONE audit pass ----
-    want_plain = "agent" in a.configs
-    want_val = "agent+validator" in a.configs
-    if want_plain or want_val:
-        print("\n=== running agent (shared audit pass) ===", flush=True)
-        try:
-            auditor = Auditor(a.repo, a.bugs, validate=False)
-            res = auditor.run()
-            audit_tokens = res.input_tokens + res.output_tokens
-            raw = res.raw_findings
-            if want_plain:
-                record("agent", [dict(f) for f in raw],
-                       {"tokens": audit_tokens, "turns": res.turns})
-            if want_val:
-                print(f"\n=== validating {len(raw)} candidate(s) for agent+validator ===",
-                      flush=True)
-                vres = AuditResult()
-                confirmed = auditor._validate([dict(f) for f in raw], vres)
-                val_tokens = vres.input_tokens + vres.output_tokens
-                record("agent+validator", confirmed,
-                       {"tokens": audit_tokens + val_tokens,
-                        "validator_tokens": val_tokens, "turns": res.turns})
-        except Exception as e:
-            for cfg in ("agent", "agent+validator"):
-                if cfg in a.configs:
-                    rows[cfg] = {"error": str(e)}
+    for c in cells:
+        for k in range(1, a.runs + 1):
+            d = out / safe(c["model"]) / c["audit"].cell() / f"run{k}"
+            print(f"\n=== {c['model']} {c['audit'].cell()} run {k}/{a.runs} ===",
+                  flush=True)
+            try:
+                audit = run_audit_pass(c, k, ws, units, d, a,
+                                       lambda m: print(m, flush=True))
+            except FatalBackendError as e:
+                sys.exit(f"\nstopping: {e}\nnothing was saved for this pass; fix it "
+                         f"and rerun with --out {out} to resume")
+            for vcfg in c["validations"].values():
+                run_validation(c, audit, vcfg, ws, d, a, lambda m: print(m, flush=True))
 
-    # ---- full pipeline (separate run, it's a different audit) ----
-    if "agent+context+variants" in a.configs:
-        print("\n=== running agent+context+variants ===", flush=True)
-        try:
-            res = Auditor(a.repo, a.bugs, validate=True,
-                          use_context=True, use_variants=True).run()
-            record("agent+context+variants", res.findings,
-                   {"tokens": res.input_tokens + res.output_tokens, "turns": res.turns})
-        except Exception as e:
-            rows["agent+context+variants"] = {"error": str(e)}
-
-    # ---- table ----
-    cols = ["precision", "recall", "f1", "tp", "fp", "fn", "tokens"]
-    width = max(len(c) for c in ALL_CONFIGS) + 2
-    print(f"\n{'config':<{width}}" + "".join(f"{c:>11}" for c in cols))
-    print("-" * (width + 11 * len(cols)))
-    for cfg in a.configs:
-        r = rows.get(cfg, {})
-        if "error" in r:
-            print(f"{cfg:<{width}}  ERROR: {r['error'][:60]}")
-            continue
-        print(f"{cfg:<{width}}" + "".join(f"{r.get(c, '-'):>11}" for c in cols))
-
-    # ---- save everything ----
-    meta = {"repo": a.repo, "labels": a.labels, "bugs": a.bugs,
-            "configs": a.configs, "timestamp": datetime.now().isoformat()}
-    (out_dir / "summary.json").write_text(json.dumps({"meta": meta, "scores": rows}, indent=2))
-    for cfg, fl in found.items():
-        (out_dir / f"{cfg}.json").write_text(json.dumps(fl, indent=2))
-    Path("experiment_results.json").write_text(json.dumps(rows, indent=2))  # back-compat
-    print(f"\nresults saved to {out_dir}/  (analyse free with: "
-          f"python3 eval/analyze.py {out_dir}/<config>.json {a.labels} --repo {a.repo})")
+    print(f"\ndone. results in {out}\nscore them (free): python eval/report.py {out}")
 
 
 if __name__ == "__main__":
