@@ -22,24 +22,48 @@ from .sarif import sarif_to_findings
 from .tools import semgrep_exe
 
 
-def semgrep_baseline(repo: str, config: str = "auto") -> list[dict]:
-    """Run semgrep with SARIF output and normalize to the common schema."""
-    exe = semgrep_exe()
-    if not exe:
-        raise RuntimeError("semgrep not installed: pip install semgrep")
-    root = Path(repo).resolve()
-    out = subprocess.run(
-        [exe, "--config", config, "--sarif", "--quiet", "--no-git-ignore", str(root)],
-        capture_output=True, text=True, timeout=600, encoding="utf-8", errors="replace",
-    )
+def _semgrep_sarif(exe: str, config: str, target: Path, include: list[str],
+                   timeout: int) -> list[dict]:
+    cmd = [exe, "--config", config, "--sarif", "--quiet", "--no-git-ignore"]
+    for pat in include:
+        cmd += ["--include", pat]
+    out = subprocess.run(cmd + [str(target)], capture_output=True, text=True,
+                         timeout=timeout, encoding="utf-8", errors="replace")
     try:
         sarif = json.loads(out.stdout)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"semgrep did not return SARIF: {out.stderr[:300]}") from e
     findings = sarif_to_findings(sarif)
-    # make paths repo-relative POSIX so they match labels on any OS
-    for f in findings:
-        f["file"] = repo_relative(f["file"], root)
+    for f in findings:   # repo-relative POSIX so they match labels on any OS
+        f["file"] = repo_relative(f["file"], target)
+    return findings
+
+
+def semgrep_baseline(repo: str, config: str = "auto", per_project: bool = False,
+                     include: list[str] | None = None, timeout: int = 600,
+                     log=print) -> list[dict]:
+    """Run semgrep with SARIF output and normalize to the common schema.
+    per_project scans each top-level folder separately (multi-project benchmarks),
+    so one huge project can't time out the whole baseline; a project that fails
+    is logged and skipped, and its name goes in the returned findings' absence."""
+    exe = semgrep_exe()
+    if not exe:
+        raise RuntimeError("semgrep not installed: pip install semgrep")
+    root = Path(repo).resolve()
+    include = include or []
+    if not per_project:
+        return _semgrep_sarif(exe, config, root, include, timeout)
+    findings = []
+    for proj in sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        try:
+            fs = _semgrep_sarif(exe, config, proj, include, timeout)
+        except Exception as e:   # one project failing must not lose the rest
+            log(f"  ! semgrep on {proj.name}: {str(e)[:120]}")
+            continue
+        for f in fs:
+            f["file"] = f"{proj.name}/{f['file']}"
+        findings += fs
+        log(f"  semgrep {proj.name}: {len(fs)} hit(s)")
     return findings
 
 

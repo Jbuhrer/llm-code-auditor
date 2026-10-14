@@ -92,24 +92,51 @@ def cve_year(cve: str) -> int | None:
     return _int(parts[1]) if len(parts) > 2 else None
 
 
-def select(projects: dict[str, Project], cwes: list[str], per_cwe: int, seed: int,
-           min_year: int | None = None, only: list[str] | None = None) -> list[Project]:
-    """Seeded, CWE-stratified pick of scorable projects (ones with ground truth).
+def pools(projects: dict[str, Project], cwes: list[str], seed: int,
+          min_year: int | None = None, only: list[str] | None = None) -> dict[str, list[Project]]:
+    """Per CWE, every scorable project (one with ground truth) in seeded order.
     min_year keeps only CVEs from that year on (contamination control); only
     restricts to slugs containing any of the given substrings."""
     import random
     rng = random.Random(seed)
-    want = [norm_cwe(c) for c in cwes]
-    picked = []
-    for cwe in want:
+    out = {}
+    for cwe in [norm_cwe(c) for c in cwes]:
         pool = sorted((p for p in projects.values()
                        if p.cwe == cwe and p.methods
                        and (min_year is None or (cve_year(p.cve) or 0) >= min_year)
                        and (not only or any(o in p.slug for o in only))),
                       key=lambda p: p.slug)
         rng.shuffle(pool)
+        out[cwe] = pool
+    return out
+
+
+def select(projects: dict[str, Project], cwes: list[str], per_cwe: int, seed: int,
+           min_year: int | None = None, only: list[str] | None = None) -> list[Project]:
+    """Seeded, CWE-stratified pick: the first per_cwe of each pool (0 = all)."""
+    picked = []
+    for pool in pools(projects, cwes, seed, min_year, only).values():
         picked += pool[:per_cwe] if per_cwe > 0 else pool
     return picked
+
+
+def audited_files(project_dir: Path, classes=("path", "cmdi", "xss", "codei")) -> int:
+    """How many files the project-file units would audit: Java, not test or demo
+    code, and passing the keyword pre-filter. Same rules as auditor/units.py."""
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from auditor.prefilter import keep, is_test, is_non_product
+    n = 0
+    for f in project_dir.rglob("*.java"):
+        rel = f.relative_to(project_dir).as_posix()
+        if ".git" in f.parts or is_test(rel) or is_non_product(rel):
+            continue
+        try:
+            if keep(f.read_text(encoding="utf-8", errors="replace"), list(classes)):
+                n += 1
+        except OSError:
+            pass
+    return n
 
 
 def _git(args: list[str], cwd: Path) -> bool:
@@ -191,7 +218,13 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--fetch", action="store_true", help="download the project sources")
     ap.add_argument("--list", action="store_true", help="print the pick, write nothing")
+    ap.add_argument("--max-files", type=int, default=None,
+                    help="size cap: skip projects that would audit more files than "
+                         "this and take the next seeded pick with the same CWE "
+                         "(needs --fetch; skipped ones are logged in selection.json)")
     a = ap.parse_args()
+    if a.max_files and not a.fetch:
+        ap.error("--max-files needs --fetch (sizes are measured on the sources)")
 
     here = Path(__file__).resolve().parent / "cwe_bench_java"
     data_dir = fetch_data(a.version, a.data_dir or here / "data" / a.version)
@@ -205,10 +238,37 @@ def main():
     if a.list:
         return
 
-    name = f"{a.version}_s{a.seed}_n{a.per_cwe}" + (f"_y{a.min_year}" if a.min_year else "")
+    name = (f"{a.version}_s{a.seed}_n{a.per_cwe}" + (f"_y{a.min_year}" if a.min_year else "")
+            + (f"_m{a.max_files}" if a.max_files else ""))
     out = a.out_dir or here / name
     proj_root = out / "projects"
     proj_root.mkdir(parents=True, exist_ok=True)
+    skipped = []
+    if a.max_files:
+        import shutil
+        picked = []
+        for cwe, pool in pools(projects, a.cwes, a.seed, a.min_year, a.only).items():
+            took = 0
+            for p in pool:
+                if a.per_cwe > 0 and took >= a.per_cwe:
+                    break
+                ok, how = fetch_project(p, proj_root)
+                n = audited_files(proj_root / p.slug) if ok else None
+                if ok and n <= a.max_files:
+                    picked.append(p)
+                    took += 1
+                    print(f"  keep {p.slug}: {n} files")
+                    continue
+                why = f"{n} files > cap {a.max_files}" if ok else how
+                skipped.append({"slug": p.slug, "cve": p.cve, "cwe": p.cwe, "why": why})
+                print(f"  skip {p.slug}: {why}")
+                if (proj_root / p.slug).exists():   # keep it out of the workspace
+                    dest = out / "skipped" / p.slug
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if not dest.exists():
+                        shutil.move(str(proj_root / p.slug), str(dest))
+            if a.per_cwe > 0 and took < a.per_cwe:
+                print(f"  ! {cwe}: only {took} project(s) fit under the cap")
     labels, selection = [], []
     for p in picked:
         entry = {"slug": p.slug, "cve": p.cve, "cwe": p.cwe, "year": cve_year(p.cve),
@@ -219,13 +279,15 @@ def main():
             entry.update({"fetched": ok, "fetch_ref": how})
             if ok:
                 entry.update(project_size(proj_root / p.slug))
+                entry["audited_files"] = audited_files(proj_root / p.slug)
             print(f"  {'ok ' if ok else 'FAIL'} {p.slug}: {how}")
         selection.append(entry)
         labels += labels_for(p)
     (out / "labels.json").write_text(json.dumps(labels, indent=2))
     (out / "selection.json").write_text(json.dumps(
         {"version": a.version, "seed": a.seed, "per_cwe": a.per_cwe,
-         "min_year": a.min_year, "cwes": a.cwes, "projects": selection}, indent=2))
+         "min_year": a.min_year, "max_files": a.max_files, "cwes": a.cwes,
+         "projects": selection, "skipped_for_size": skipped}, indent=2))
     print(f"\n{len(labels)} labelled methods across {len(picked)} projects -> {out}")
     if not a.fetch:
         print("sources not downloaded yet; rerun with --fetch")

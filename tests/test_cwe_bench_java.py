@@ -90,7 +90,8 @@ def test_project_units_prefilter_and_scope(tmp_path):
     units, stats = build_project_units(Workspace(str(repo)), ["path"])
     assert [u.id for u in units] == ["acme__app_CVE-2021-9_1.0/src/main/java/Files.java"]
     assert units[0].root == "acme__app_CVE-2021-9_1.0"
-    assert stats["acme__app_CVE-2021-9_1.0"] == {"files": 3, "tests": 1, "kept": 1}
+    assert stats["acme__app_CVE-2021-9_1.0"] == {"files": 3, "tests": 1, "non_product": 0,
+                                                 "kept": 1}
     units, _ = build_project_units(Workspace(str(repo)), ["path"], prefilter=False)
     assert len(units) == 2   # Math.java kept without the pre-filter, test still dropped
 
@@ -106,3 +107,46 @@ def test_method_scoring(tmp_path):
     assert near["tp"] == 0 and near["file_recall"] == 1.0 and near["off_target_findings"] == 1
     wrong_class = score([{"bug_class": "xss", "file": f, "line": 3}], labels, "method", repo)
     assert wrong_class["tp"] == 0 and wrong_class["file_recall"] == 0.0
+
+
+def test_project_units_skip_non_java_and_demo_code(tmp_path):
+    from auditor.tools import Workspace
+    from auditor.units import build_project_units
+    repo, _ = _project_repo(tmp_path)
+    base = repo / "acme__app_CVE-2021-9_1.0"
+    for rel in ("docs/site.js", "web/app.min.js", "samples/demo/src/D.java",
+                "apps/showcase/src/S.java", "acme-sample-app/src/X.java"):
+        f = base / rel
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text("class X { void f() { new java.io.File(\"x\"); } }\n")
+    units, stats = build_project_units(Workspace(str(repo)), ["path"])
+    assert [u.id.split("/", 1)[1] for u in units] == ["src/main/java/Files.java"]
+    assert stats["acme__app_CVE-2021-9_1.0"]["non_product"] == 3   # .js never counted
+
+
+def test_max_files_swaps_big_projects(tmp_path, monkeypatch):
+    import json
+    import sys
+    import benchmarks.cwe_bench_java as cbj
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "project_info.csv").write_text(PROJECTS)
+    (tmp_path / "data" / "fix_info.csv").write_text(FIXES)
+    sizes = {"a__x_CVE-2021-1_1.0": 900, "b__y_CVE-2023-2_2.0": 40}
+
+    def fake_fetch(p, root):
+        (root / p.slug).mkdir(parents=True, exist_ok=True)
+        return True, "abc"
+    monkeypatch.setattr(cbj, "fetch_project", fake_fetch)
+    monkeypatch.setattr(cbj, "audited_files", lambda d: sizes.get(d.name, 1))
+    monkeypatch.setattr(cbj, "project_size", lambda d: {})
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["x", "--data-dir", str(tmp_path / "data"), "--cwes", "22",
+                                      "--per-cwe", "1", "--fetch", "--max-files", "100",
+                                      "--out-dir", str(out)])
+    cbj.main()
+    sel = json.loads((out / "selection.json").read_text())
+    assert [p["slug"] for p in sel["projects"]] == ["b__y_CVE-2023-2_2.0"]
+    assert [s["slug"] for s in sel["skipped_for_size"]] in ([], ["a__x_CVE-2021-1_1.0"])
+    assert not (out / "projects" / "a__x_CVE-2021-1_1.0").exists()   # moved out of the way
+    assert {l["project"] for l in json.loads((out / "labels.json").read_text())} == \
+        {"b__y_CVE-2023-2_2.0"}

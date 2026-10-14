@@ -51,21 +51,24 @@ class Unit:
     root: str = ""
 
 
-def build_project_units(ws: Workspace, classes: list[str],
-                        prefilter: bool = True) -> tuple[list[Unit], dict]:
+def build_project_units(ws: Workspace, classes: list[str], prefilter: bool = True,
+                        exts: tuple[str, ...] = (".java",)) -> tuple[list[Unit], dict]:
     """One unit per kept file, confined to its project (a top-level folder of
     the workspace). Test code is dropped; with prefilter, so are files that never
     mention an API relevant to the classes. Returns (units, stats)."""
-    from .prefilter import keep, is_test
+    from .prefilter import keep, is_test, is_non_product
     units, stats = [], {}
-    for f in ws.source_files():
+    for f in ws.source_files(set(exts)):
         project, _, inner = f.partition("/")
         if not inner:
             continue
-        s = stats.setdefault(project, {"files": 0, "tests": 0, "kept": 0})
+        s = stats.setdefault(project, {"files": 0, "tests": 0, "non_product": 0, "kept": 0})
         s["files"] += 1
         if is_test(inner):
             s["tests"] += 1
+            continue
+        if is_non_product(inner):
+            s["non_product"] += 1
             continue
         if prefilter and not keep("\n".join(ws.lines(f)), classes):
             continue

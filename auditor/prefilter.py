@@ -23,8 +23,18 @@ KEYWORDS = {
 TEST_PATH = re.compile(r"(^|/)(src/test|test|tests|testing|it)/|Test[s]?\.java$")
 
 
+# demo apps, samples and docs ship in the repo but aren't the library the CVE is
+# in; auditing them costs money and only adds off-target findings
+NON_PRODUCT = re.compile(r"(^|/)(docs?|samples?|examples?|showcase|demos?|apps/showcase)/"
+                         r"|\.min\.js$")
+
+
 def is_test(path: str) -> bool:
     return bool(TEST_PATH.search(path))
+
+
+def is_non_product(path: str) -> bool:
+    return bool(NON_PRODUCT.search(path)) or "-sample" in path or "-example" in path
 
 
 def keep(text: str, classes: list[str]) -> bool:

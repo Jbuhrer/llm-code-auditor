@@ -188,6 +188,21 @@ def main():
         md.append("\nRun health (worth a look before trusting a row):\n")
         md += [f"- {w}" for w in sorted(set(warn))[:40]]
 
+    if mode == "method":
+        # which CVEs the agent could even reach: was any bug file among the units?
+        audited = set().union(*[r["audited"] for runs in rows.values() for r in runs]) \
+            if rows else set()
+        by_cve: dict[str, set] = {}
+        for l in labels:
+            by_cve.setdefault(l.get("cve") or l["file"], set()).add(l["file"])
+        reachable = sorted(c for c, fs in by_cve.items() if fs & audited)
+        missed = sorted(set(by_cve) - set(reachable))
+        md.append(f"\nPre-filter: a bug file was audited for {len(reachable)} of "
+                  f"{len(by_cve)} CVEs. CVEs it dropped can't be found by any config, so "
+                  f"they count against the pre-filter, not the agent"
+                  + (f": {', '.join(missed)}." if missed else "."))
+        js["prefilter"] = {"reachable": reachable, "missed": missed}
+
     base_path = root / "baseline" / "semgrep.json"
     if base_path.exists():
         bf = json.loads(base_path.read_text())["findings"]

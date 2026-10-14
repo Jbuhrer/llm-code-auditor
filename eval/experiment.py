@@ -352,7 +352,10 @@ def main():
         print("\n=== baseline: semgrep (tool only) ===", flush=True)
         try:
             t0 = time.monotonic()
-            fs = semgrep_baseline(a.repo, a.semgrep_config)
+            multi = unit_mode.startswith("project-file")
+            fs = semgrep_baseline(a.repo, a.semgrep_config, per_project=multi,
+                                  include=["*.java"] if multi else None,
+                                  timeout=1800 if multi else 600)
             write_json(out / "baseline" / "semgrep.json",
                        {"findings": fs, "wall_seconds": round(time.monotonic() - t0, 2)})
         except Exception as e:
