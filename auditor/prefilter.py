@@ -18,7 +18,9 @@ KEYWORDS = {
              "ArgumentListBuilder", "Launcher", "ProcStarter", "DefaultExecutor"],
     "xss": ["HttpServletResponse", "getWriter(", "PrintWriter", "ResponseBody", "html",
             "Html", "escape", "Escape", "sanitize", "Sanitize", "Policy",
-            "getParameter", "JspWriter", "sendRedirect", "Markup"],
+            "getParameter", "JspWriter", "sendRedirect", "Markup",
+            # code that builds HTML by hand (wiki plugins, error pages)
+            "href", "<a ", "<li", "<ul", "<div", "<span", "<td", "<table"],
     "codei": ["ScriptEngine", "ExpressionParser", "Expression", "Ognl", "OGNL",
               "ELProcessor", "ValueStack", "Class.forName", "defineClass", "MVEL",
               "Velocity", "freemarker", "Freemarker", "groovy", "Groovy", "eval(",

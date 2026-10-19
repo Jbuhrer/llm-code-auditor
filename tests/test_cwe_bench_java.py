@@ -260,3 +260,30 @@ def test_screen_stance_changes_only_the_reporting_bar():
     from auditor.config import AuditConfig
     assert AuditConfig(stance="screen").cell().endswith("-screen")
     assert AuditConfig().cell() == "explore-sa"
+
+
+def test_label_paths_follow_package_renames(tmp_path):
+    """CVE-2021-30181: the fix commit is under org/apache/dubbo but the
+    vulnerable 2.6.8 source is under com/alibaba/dubbo. The label must point at
+    the file that was actually audited, or a real hit scores as a miss."""
+    from benchmarks.cwe_bench_java import resolve_label_paths
+    real = tmp_path / "dubbo/dubbo-cluster/src/main/java/com/alibaba/dubbo/rpc/cluster/router/script"
+    real.mkdir(parents=True)
+    (real / "ScriptRouter.java").write_text("class ScriptRouter {}\n")
+    other = tmp_path / "dubbo/dubbo-other/src/main/java/x"
+    other.mkdir(parents=True)
+    (other / "ScriptRouter.java").write_text("class ScriptRouter {}\n")
+    fix = "dubbo/dubbo-cluster/src/main/java/org/apache/dubbo/rpc/cluster/router/script/ScriptRouter.java"
+    labels = [{"file": fix, "cve": "CVE-2021-30181"},
+              {"file": "dubbo/gone/Missing.java", "cve": "CVE-X"}]
+    notes = resolve_label_paths(tmp_path, labels)
+    assert labels[0]["file"] == ("dubbo/dubbo-cluster/src/main/java/com/alibaba/dubbo/rpc/"
+                                 "cluster/router/script/ScriptRouter.java")
+    assert labels[0]["fix_file"] == fix
+    assert labels[1]["file"] == "dubbo/gone/Missing.java" and "left as is" in notes[1]
+
+
+def test_prefilter_keeps_hand_built_html():
+    """CVE-2019-10078: a JSPWiki plugin builds links by string concatenation."""
+    from auditor.prefilter import keep
+    assert keep('sb.append("<a href=\\"" + url + "\\">" + name + "</a>");', ["xss"])

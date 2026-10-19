@@ -235,6 +235,40 @@ def labels_for(p: Project) -> list[dict]:
     return out
 
 
+def resolve_label_paths(proj_root: Path, labels: list[dict]) -> list[str]:
+    """Fix-commit paths don't always exist at the vulnerable commit (a package
+    renamed between them, e.g. Dubbo's com.alibaba -> org.apache). Point each
+    such label at the same-named file in the project, preferring the longest
+    shared path suffix. The original is kept as fix_file. Returns change notes."""
+    notes, index = [], {}
+    for l in labels:
+        if (proj_root / l["file"]).exists():
+            continue
+        project, _, inner = l["file"].partition("/")
+        if project not in index:
+            root = proj_root / project
+            index[project] = ([q.relative_to(root).as_posix() for q in root.rglob("*.java")]
+                              if root.is_dir() else [])
+        name = inner.rsplit("/", 1)[-1]
+        same = [c for c in index[project] if c.rsplit("/", 1)[-1] == name]
+        if not same:
+            notes.append(f"{l.get('cve')}: {l['file']} has no same-named file; left as is")
+            continue
+
+        def shared(c, parts=inner.split("/")[::-1]):
+            n = 0
+            for x, y in zip(c.split("/")[::-1], parts):
+                if x != y:
+                    break
+                n += 1
+            return n
+        best = max(same, key=shared)
+        l.setdefault("fix_file", l["file"])
+        l["file"] = f"{project}/{best}"
+        notes.append(f"{l.get('cve')}: {inner} -> {best}")
+    return notes
+
+
 def main():
     import argparse
     import json
@@ -334,6 +368,9 @@ def main():
     if failed:
         print(f"  ! {len(failed)} project(s) failed to fetch and are left out of the labels: "
               + ", ".join(failed))
+    if a.fetch:
+        for note in dict.fromkeys(resolve_label_paths(proj_root, labels)):
+            print(f"  label path: {note}")
     (out / "labels.json").write_text(json.dumps(labels, indent=2))
     (out / "selection.json").write_text(json.dumps(
         {"version": a.version, "seed": a.seed, "per_cwe": a.per_cwe,
