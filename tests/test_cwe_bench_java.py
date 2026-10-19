@@ -287,3 +287,21 @@ def test_prefilter_keeps_hand_built_html():
     """CVE-2019-10078: a JSPWiki plugin builds links by string concatenation."""
     from auditor.prefilter import keep
     assert keep('sb.append("<a href=\\"" + url + "\\">" + name + "</a>");', ["xss"])
+
+
+def test_prefilter_ignores_reflection_and_serializable_hooks():
+    from auditor.prefilter import keep
+    assert not keep("m.getParameterTypes(); m.getParameters();", ["xss"])
+    assert not keep("private void readObject(ObjectInputStream s)", ["xss"])
+    assert keep("Object o = in.readObject();", ["codei"])
+    assert keep("String q = req.getParameter(\"q\");", ["xss"])
+
+
+def test_keyword_stats_counts_sole_keepers(tmp_path):
+    from eval.prefilter_check import keyword_stats
+    (tmp_path / "p/src").mkdir(parents=True)
+    (tmp_path / "p/src/A.java").write_text("new ProcessBuilder(x)")
+    (tmp_path / "p/src/B.java").write_text("new ProcessBuilder(x); Runtime.getRuntime()")
+    out = keyword_stats(tmp_path, [{"file": "p/src/A.java", "cve": "C1"}], ["cmdi"])
+    assert "2 files kept" in out and "| `ProcessBuilder` | 1 | 2 |" in out
+    assert "- C1: ProcessBuilder" in out

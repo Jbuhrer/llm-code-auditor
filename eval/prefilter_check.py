@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from auditor.prefilter import drop_reason  # noqa: E402
+from auditor.prefilter import KEYWORDS, drop_reason, is_non_product, is_test  # noqa: E402
 
 
 def check(repo: Path, labels: list[dict], classes: list[str], context: int = 12) -> str:
@@ -48,14 +48,52 @@ def check(repo: Path, labels: list[dict], classes: list[str], context: int = 12)
     return head + "\n".join(out)
 
 
+def keyword_stats(repo: Path, labels: list[dict], classes: list[str]) -> str:
+    """What each keyword costs and buys: files kept ONLY because of it (dropping
+    the keyword drops exactly those), and which keywords keep each CVE's bug file."""
+    words = sorted({w for c in classes for w in KEYWORDS.get(c, [])})
+    sole, any_hit, kept, texts = {w: 0 for w in words}, {w: 0 for w in words}, 0, {}
+    for f in sorted(repo.rglob("*.java")):
+        rel = f.relative_to(repo).as_posix()
+        inner = rel.partition("/")[2]
+        if not inner or is_test(inner) or is_non_product(inner):
+            continue
+        text = f.read_text(errors="replace")
+        hits = [w for w in words if w in text]
+        if not hits:
+            continue
+        kept += 1
+        texts[rel] = hits
+        for w in hits:
+            any_hit[w] += 1
+        if len(hits) == 1:
+            sole[hits[0]] += 1
+    out = [f"\n# keyword stats: {kept} files kept\n",
+           "| keyword | files only it keeps | files it matches |", "|---|---|---|"]
+    for w in sorted(words, key=lambda w: -sole[w]):
+        out.append(f"| `{w}` | {sole[w]} | {any_hit[w]} |")
+    out.append("\n# keywords keeping each CVE's bug files\n")
+    by_cve: dict[str, set] = {}
+    for l in labels:
+        by_cve.setdefault(l.get("cve") or l["file"], set()).update(texts.get(l["file"], ["(dropped)"]))
+    for cve, ws in sorted(by_cve.items()):
+        out.append(f"- {cve}: {', '.join(sorted(ws))}")
+    return "\n".join(out)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("repo")
     ap.add_argument("labels")
     ap.add_argument("--bugs", nargs="+", default=["path", "cmdi", "xss", "codei"])
+    ap.add_argument("--keywords", action="store_true",
+                    help="also print what each keyword costs (files kept only by it)")
     a = ap.parse_args()
-    print(check(Path(a.repo), json.loads(Path(a.labels).read_text()), a.bugs))
+    labels = json.loads(Path(a.labels).read_text())
+    print(check(Path(a.repo), labels, a.bugs))
+    if a.keywords:
+        print(keyword_stats(Path(a.repo), labels, a.bugs))
 
 
 if __name__ == "__main__":

@@ -15,17 +15,20 @@ KEYWORDS = {
              "getResource", ".resolve(", "Files."],
     "cmdi": ["Runtime.getRuntime", "ProcessBuilder", ".exec(", "Commandline", "CommandLine",
              # Jenkins and commons-exec run processes without ProcessBuilder in sight
-             "ArgumentListBuilder", "Launcher", "ProcStarter", "DefaultExecutor"],
+             "ArgumentListBuilder", "ProcStarter", ".launch(", "DefaultExecutor"],
     "xss": ["HttpServletResponse", "getWriter(", "PrintWriter", "ResponseBody", "html",
             "Html", "escape", "Escape", "sanitize", "Sanitize", "Policy",
-            "getParameter", "JspWriter", "sendRedirect", "Markup",
+            # exact calls: getParameterTypes() etc. are reflection, everywhere
+            "getParameter(", "getParameterValues(", "JspWriter", "sendRedirect(",
             # code that builds HTML by hand (wiki plugins, error pages)
             "href", "<a ", "<li", "<ul", "<div", "<span", "<td", "<table"],
     "codei": ["ScriptEngine", "ExpressionParser", "Expression", "Ognl", "OGNL",
               "ELProcessor", "ValueStack", "Class.forName", "defineClass", "MVEL",
               "Velocity", "freemarker", "Freemarker", "groovy", "Groovy", "eval(",
               # CWE-94 in CWE-Bench-Java also covers deserialization and JNDI RCE
-              "Yaml", "ObjectInputStream", "readObject", "XStream", "fromXML",
+              # .readObject() is a deserialization call; readObject( alone matches
+              # every custom Serializable hook
+              "Yaml", "ObjectInputStream", ".readObject()", "XStream", "fromXML",
               "parseObject", "Hessian", "InitialContext", "Nashorn"],
 }
 TEST_PATH = re.compile(r"(^|/)(src/test|test|tests|testing|it)/|Test[s]?\.java$")
