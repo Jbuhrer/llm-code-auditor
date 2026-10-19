@@ -230,7 +230,7 @@ def test_prefilter_keeps_indirect_sinks():
     assert keep("new ArgumentListBuilder().add(image)", ["cmdi"])
     assert keep("new Yaml().load(rule)", ["codei"])
     assert keep("new ObjectInputStream(in).readObject()", ["codei"])
-    assert keep("out.print(request.getParameter(\"q\"))", ["xss"])
+    assert keep("JspWriter out = pageContext.getOut();", ["xss"])
     assert drop_reason("src/main/java/A.java", "int x = 1;", ["cmdi"]) == "no keyword for cmdi"
     assert drop_reason("src/test/java/A.java", "", ["cmdi"]) == "test path"
     assert drop_reason("src/main/java/A.java", "Runtime.getRuntime()", ["cmdi"]) is None
@@ -294,7 +294,7 @@ def test_prefilter_ignores_reflection_and_serializable_hooks():
     assert not keep("m.getParameterTypes(); m.getParameters();", ["xss"])
     assert not keep("private void readObject(ObjectInputStream s)", ["xss"])
     assert keep("Object o = in.readObject();", ["codei"])
-    assert keep("String q = req.getParameter(\"q\");", ["xss"])
+    assert not keep("import com.thoughtworks.xstream.XStream;", ["codei"])
 
 
 def test_keyword_stats_counts_sole_keepers(tmp_path):

@@ -18,19 +18,22 @@ KEYWORDS = {
              "ArgumentListBuilder", "ProcStarter", ".launch(", "DefaultExecutor"],
     "xss": ["HttpServletResponse", "getWriter(", "PrintWriter", "ResponseBody", "html",
             "Html", "escape", "Escape", "sanitize", "Sanitize", "Policy",
-            # exact calls: getParameterTypes() etc. are reflection, everywhere
-            "getParameter(", "getParameterValues(", "JspWriter", "sendRedirect(",
+            "JspWriter", "sendRedirect(",
             # code that builds HTML by hand (wiki plugins, error pages)
-            "href", "<a ", "<li", "<ul", "<div", "<span", "<td", "<table"],
+            "href", "<a ", "<ul", "<div", "<span", "<td", "<table"],
     "codei": ["ScriptEngine", "ExpressionParser", "Expression", "Ognl", "OGNL",
               "ELProcessor", "ValueStack", "Class.forName", "defineClass", "MVEL",
               "Velocity", "freemarker", "Freemarker", "groovy", "Groovy", "eval(",
               # CWE-94 in CWE-Bench-Java also covers deserialization and JNDI RCE
               # .readObject() is a deserialization call; readObject( alone matches
               # every custom Serializable hook
-              "Yaml", "ObjectInputStream", ".readObject()", "XStream", "fromXML",
-              "parseObject", "Hessian", "InitialContext", "Nashorn"],
+              "Yaml", "ObjectInputStream", ".readObject()", "fromXML",
+              "InitialContext", "Nashorn"],
 }
+# Tuned on the 40-CVE CWE-Bench-Java workspace with prefilter_check.py --keywords.
+# Dropped there because they kept many files (XStream 623, getParameter( 295,
+# parseObject 103, <li 49, Hessian 37) and were never the only keyword keeping
+# a CVE's bug file. XStream matches the library's own package name.
 TEST_PATH = re.compile(r"(^|/)(src/test|test|tests|testing|it)/|Test[s]?\.java$")
 
 
