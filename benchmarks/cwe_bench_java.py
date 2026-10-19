@@ -148,6 +148,23 @@ def _git(args: list[str], cwd: Path) -> bool:
     return r.returncode == 0
 
 
+def free_gb(path: Path) -> float:
+    import shutil
+    while not path.exists():
+        path = path.parent
+    return shutil.disk_usage(path).free / 1e9
+
+
+def ensure_space(path: Path, min_gb: float) -> None:
+    """Stop cleanly before a fetch would run the disk out. Already-fetched
+    projects are kept, so rerunning after freeing space picks up where it stopped."""
+    free = free_gb(path)
+    if free < min_gb:
+        raise SystemExit(f"\nstopping: only {free:.1f} GB free (need {min_gb:.1f}). "
+                         "Free some space and rerun the same command; projects "
+                         "already fetched are skipped.")
+
+
 def fetch_project(p: Project, dest_root: Path) -> tuple[bool, str]:
     """Shallow-fetch exactly the vulnerable commit into dest_root/<slug>.
     Falls back to the release tag. Already-fetched projects are skipped."""
@@ -165,7 +182,23 @@ def fetch_project(p: Project, dest_root: Path) -> tuple[bool, str]:
                 and _git(["checkout", "-q", "--force", "FETCH_HEAD"], dest):
             (dest / ".fetched").write_text(ref + "\n")
             return True, ref
+    # never leave a half-checked-out project where the experiment would audit it
+    import shutil
+    shutil.rmtree(dest, ignore_errors=True)
     return False, "could not fetch commit or tag"
+
+
+def fetch_or_stop(p: Project, dest_root: Path, min_gb: float) -> tuple[bool, str]:
+    """fetch_project, but a failure caused by low disk stops the run instead of
+    counting as a skip. Otherwise a full disk would silently swap CVEs out of
+    the sample (it did once: a project failed to fetch and its slot went to the
+    next pick)."""
+    if not (dest_root / p.slug / ".fetched").exists():
+        ensure_space(dest_root, min_gb)
+    ok, how = fetch_project(p, dest_root)
+    if not ok:
+        ensure_space(dest_root, min_gb)   # failed because the disk filled mid-fetch?
+    return ok, how
 
 
 def project_size(root: Path) -> dict:
@@ -218,6 +251,8 @@ def main():
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--fetch", action="store_true", help="download the project sources")
     ap.add_argument("--list", action="store_true", help="print the pick, write nothing")
+    ap.add_argument("--min-free-gb", type=float, default=5.0,
+                    help="stop before fetching if free disk space drops below this")
     ap.add_argument("--max-files", type=int, default=None,
                     help="size cap: skip projects that would audit more files than "
                          "this and take the next seeded pick with the same CWE "
@@ -232,7 +267,9 @@ def main():
     picked = select(projects, a.cwes, a.per_cwe, a.seed, a.min_year, a.only)
     scorable = sum(1 for p in projects.values() if p.methods)
     print(f"{a.version}: {len(projects)} CVEs, {scorable} with ground truth; "
-          f"picked {len(picked)}")
+          + (f"{len(picked)} first candidates (the size cap may swap some; "
+             "the keep/skip lines below are the real pick)" if a.max_files
+             else f"picked {len(picked)}"))
     for p in picked:
         print(f"  {p.cwe:<8} {p.cve:<16} {p.slug}  ({len(p.methods)} fixed methods)")
     if a.list:
@@ -252,7 +289,7 @@ def main():
             for p in pool:
                 if a.per_cwe > 0 and took >= a.per_cwe:
                     break
-                ok, how = fetch_project(p, proj_root)
+                ok, how = fetch_or_stop(p, proj_root, a.min_free_gb)
                 n = audited_files(proj_root / p.slug) if ok else None
                 if ok and n <= a.max_files:
                     picked.append(p)
@@ -262,11 +299,10 @@ def main():
                 why = f"{n} files > cap {a.max_files}" if ok else how
                 skipped.append({"slug": p.slug, "cve": p.cve, "cwe": p.cwe, "why": why})
                 print(f"  skip {p.slug}: {why}")
-                if (proj_root / p.slug).exists():   # keep it out of the workspace
-                    dest = out / "skipped" / p.slug
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    if not dest.exists():
-                        shutil.move(str(proj_root / p.slug), str(dest))
+                if (proj_root / p.slug).exists():
+                    # delete it: skipped projects are the giant ones, and keeping
+                    # them is what filled the disk. It's logged in selection.json.
+                    shutil.rmtree(proj_root / p.slug, ignore_errors=True)
             if a.per_cwe > 0 and took < a.per_cwe:
                 print(f"  ! {cwe}: only {took} project(s) fit under the cap")
     labels, selection = [], []
@@ -275,20 +311,36 @@ def main():
                  "repo": p.repo_url, "buggy_commit": p.buggy_commit, "tag": p.tag,
                  "advisory": p.advisory, "fixed_methods": len(p.methods)}
         if a.fetch:
-            ok, how = fetch_project(p, proj_root)
+            ok, how = fetch_or_stop(p, proj_root, a.min_free_gb)
             entry.update({"fetched": ok, "fetch_ref": how})
             if ok:
                 entry.update(project_size(proj_root / p.slug))
                 entry["audited_files"] = audited_files(proj_root / p.slug)
             print(f"  {'ok ' if ok else 'FAIL'} {p.slug}: {how}")
         selection.append(entry)
+        if a.fetch and not entry.get("fetched"):
+            continue   # no code on disk: labelling it would count a miss the agent never had a chance at
         labels += labels_for(p)
+    if a.fetch:
+        import shutil
+        keep = {e["slug"] for e in selection if e.get("fetched")}
+        stale = sorted(d.name for d in proj_root.iterdir() if d.is_dir() and d.name not in keep)
+        for name in stale:   # leftovers from an earlier run with other settings
+            shutil.rmtree(proj_root / name, ignore_errors=True)
+        if stale:
+            print(f"  removed {len(stale)} project folder(s) not in this selection: "
+                  + ", ".join(stale))
+    failed = [e["slug"] for e in selection if a.fetch and not e.get("fetched")]
+    if failed:
+        print(f"  ! {len(failed)} project(s) failed to fetch and are left out of the labels: "
+              + ", ".join(failed))
     (out / "labels.json").write_text(json.dumps(labels, indent=2))
     (out / "selection.json").write_text(json.dumps(
         {"version": a.version, "seed": a.seed, "per_cwe": a.per_cwe,
          "min_year": a.min_year, "max_files": a.max_files, "cwes": a.cwes,
          "projects": selection, "skipped_for_size": skipped}, indent=2))
-    print(f"\n{len(labels)} labelled methods across {len(picked)} projects -> {out}")
+    n_proj = len({l["project"] for l in labels})
+    print(f"\n{len(labels)} labelled methods across {n_proj} projects -> {out}")
     if not a.fetch:
         print("sources not downloaded yet; rerun with --fetch")
 

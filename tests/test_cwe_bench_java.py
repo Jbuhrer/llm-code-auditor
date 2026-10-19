@@ -150,3 +150,74 @@ def test_max_files_swaps_big_projects(tmp_path, monkeypatch):
     assert not (out / "projects" / "a__x_CVE-2021-1_1.0").exists()   # moved out of the way
     assert {l["project"] for l in json.loads((out / "labels.json").read_text())} == \
         {"b__y_CVE-2023-2_2.0"}
+
+
+def test_space_check_stops_cleanly(tmp_path):
+    import pytest
+    from benchmarks.cwe_bench_java import ensure_space, free_gb
+    ensure_space(tmp_path / "not" / "made" / "yet", 0.0)   # walks up to an existing dir
+    with pytest.raises(SystemExit) as e:
+        ensure_space(tmp_path, free_gb(tmp_path) + 1000)
+    assert "stopping" in str(e.value) and "rerun" in str(e.value)
+
+
+def _run_loader(tmp_path, monkeypatch, fetch, sizes, extra):
+    import json
+    import sys
+    import benchmarks.cwe_bench_java as cbj
+    data = tmp_path / "data"
+    data.mkdir(exist_ok=True)
+    (data / "project_info.csv").write_text(PROJECTS)
+    (data / "fix_info.csv").write_text(FIXES)
+    monkeypatch.setattr(cbj, "fetch_project", fetch)
+    monkeypatch.setattr(cbj, "audited_files", lambda d: sizes.get(d.name, 1))
+    monkeypatch.setattr(cbj, "project_size", lambda d: {})
+    out = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["x", "--data-dir", str(data), "--cwes", "22", "79",
+                                      "--fetch", "--out-dir", str(out)] + extra)
+    cbj.main()
+    return (json.loads((out / "selection.json").read_text()),
+            json.loads((out / "labels.json").read_text()), out)
+
+
+def test_full_disk_stops_instead_of_swapping_cves(tmp_path, monkeypatch):
+    import pytest
+    import benchmarks.cwe_bench_java as cbj
+    monkeypatch.setattr(cbj, "free_gb", lambda p: 0.5)   # disk is full
+    with pytest.raises(SystemExit) as e:
+        _run_loader(tmp_path, monkeypatch, lambda p, r: (False, "x"), {},
+                    ["--per-cwe", "1", "--max-files", "100"])
+    assert "GB free" in str(e.value)
+
+
+def test_failed_fetch_gets_no_labels(tmp_path, monkeypatch):
+    def fetch(p, root):
+        if p.slug.startswith("a__"):
+            return False, "could not fetch commit or tag"   # e.g. repo deleted upstream
+        (root / p.slug).mkdir(parents=True, exist_ok=True)
+        (root / p.slug / ".fetched").write_text("ok")
+        return True, "abc"
+    sel, labels, _ = _run_loader(tmp_path, monkeypatch, fetch, {}, ["--per-cwe", "0"])
+    assert {l["project"] for l in labels} == {"b__y_CVE-2023-2_2.0", "c__z_CVE-2022-3_3.0"}
+    assert any(e["slug"].startswith("a__") and e["fetched"] is False for e in sel["projects"])
+
+
+def test_stale_projects_from_earlier_runs_are_removed(tmp_path, monkeypatch):
+    def fetch(p, root):
+        (root / p.slug).mkdir(parents=True, exist_ok=True)
+        (root / p.slug / ".fetched").write_text("ok")
+        return True, "abc"
+    stale = tmp_path / "out" / "projects" / "old__thing_CVE-2019-1_1.0"
+    stale.mkdir(parents=True)
+    _, _, out = _run_loader(tmp_path, monkeypatch, fetch, {}, ["--per-cwe", "0"])
+    assert not stale.exists()
+    assert (out / "projects" / "c__z_CVE-2022-3_3.0").exists()
+
+
+def test_failed_fetch_leaves_no_partial_folder(tmp_path, monkeypatch):
+    import benchmarks.cwe_bench_java as cbj
+    from benchmarks.cwe_bench_java import Project, fetch_project
+    monkeypatch.setattr(cbj, "_git", lambda args, cwd: args[0] in ("init", "remote"))
+    p = Project("s__p_CVE-2020-1_1", "CVE-2020-1", "CWE-22", "u", "t", "c", [], "")
+    assert fetch_project(p, tmp_path) == (False, "could not fetch commit or tag")
+    assert not (tmp_path / p.slug).exists()
