@@ -296,6 +296,9 @@ def main():
     ap.add_argument("--temperature", type=float, default=None,
                     help="open-weight backends only")
     ap.add_argument("--semgrep-config", default="auto")
+    ap.add_argument("--stance", default="precise", choices=["precise", "screen"],
+                    help="screen: recall-first first stage of a cascade (cell name "
+                         "gets a -screen suffix so results don't mix)")
     ap.add_argument("--threat-model", default="all-external", choices=list(THREAT_MODELS),
                     help="who counts as the attacker; stated in every prompt "
                          "(all-external matches Juliet's ground truth)")
@@ -321,7 +324,7 @@ def main():
         units = spread_limit(units, a.limit)
     base = AuditConfig(context_budget=a.budget, max_turns=a.max_turns, effort=a.effort,
                        temperature=a.temperature, semgrep_config=a.semgrep_config,
-                       threat_model=a.threat_model,
+                       threat_model=a.threat_model, stance=a.stance,
                        unit=unit_mode, bug_classes=tuple(a.bugs))
     cells = plan_cells(a, base)
 

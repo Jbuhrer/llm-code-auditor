@@ -98,7 +98,7 @@ class Auditor:
         self.allowed = {t["name"] for t in self.tools}
         self.system = system_prompt(list(cfg.bug_classes), self.explore,
                                     cfg.static_analysis, cfg.context_budget,
-                                    cfg.threat_model)
+                                    cfg.threat_model, cfg.stance)
 
     # ------------------------------------------------------------ public
 
@@ -325,7 +325,7 @@ def hunt_variants(backend, ws: Workspace, cfg: AuditConfig,
     usage, extra = empty_usage(), []
     seen = {(f.get("file"), f.get("line")) for f in findings}
     system = system_prompt(list(cfg.bug_classes), True, cfg.static_analysis,
-                           cfg.context_budget, cfg.threat_model)
+                           cfg.context_budget, cfg.threat_model, cfg.stance)
     tools = tool_schemas(True, cfg.static_analysis)
     for f in findings:
         candidates = find_variants(ws, f)

@@ -12,7 +12,7 @@ import hashlib
 
 from .config import EVIDENCE
 
-PROMPT_VERSION = "v4"
+PROMPT_VERSION = "v5"   # v5: stance switch; "precise" text is unchanged from v4
 
 BUG_CLASSES = {
     "sqli": "SQL injection: untrusted input reaching a SQL query without parameterization.",
@@ -105,12 +105,29 @@ Reasoning rules:
 - Code that looks almost identical to a vulnerable path but uses a constant,
   validates, or parameterizes is NOT vulnerable. Do not report it.
 
-Precision matters more than recall. A false positive is worse than a missed bug.
+{stance}
 
 When done, call report_findings exactly once with your final list. Each finding \
 needs: bug_class, file (repo-relative), line (the line of the dangerous SINK), a \
 one-sentence data-flow path (source -> ... -> sink), a CWE id, a severity, and a \
-confidence in [0,1]. Report an empty list if nothing is solid."""
+confidence in [0,1]. {closing}"""
+
+# How hard to lean toward reporting. "precise" is a standalone auditor; "screen"
+# is the cheap first stage of a cascade, where a stronger verifier checks every
+# finding, so a missed bug costs far more than a false alarm.
+STANCES = {
+    "precise": ("Precision matters more than recall. A false positive is worse than "
+                "a missed bug.", "Report an empty list if nothing is solid."),
+    "screen": ("This is a SCREENING pass. A stronger reviewer will verify every "
+               "finding you report, so recall matters more than precision: a missed "
+               "bug is far worse than a false alarm. Report every sink where "
+               "attacker-influenced data plausibly arrives, even if you cannot see the "
+               "whole path or are unsure a sanitizer is enough; say what is unverified "
+               "in the path and express doubt with a low confidence instead of leaving "
+               "it out. Still skip sinks fed only by constants.",
+               "Report an empty list only if no sink in the target could plausibly "
+               "receive attacker-influenced data."),
+}
 
 EXPLORE_MODE = """How context reaches you:
 You start with the target code below and can explore the rest of the repository \
@@ -133,12 +150,17 @@ hits as leads to verify, not as findings."""
 
 
 def system_prompt(bug_classes, explore: bool = True, static_analysis: bool = True,
-                  budget: int = 24000, threat_model: str = "all-external") -> str:
+                  budget: int = 24000, threat_model: str = "all-external",
+                  stance: str = "precise") -> str:
+    if stance not in STANCES:
+        raise ValueError(f"unknown stance {stance!r}; known: {list(STANCES)}")
+    stance_text, closing = STANCES[stance]
     if explore:
         mode = EXPLORE_MODE.format(budget=budget, sa=EXPLORE_SA if static_analysis else "")
     else:
         mode = FIXED_MODE.format(sa=FIXED_SA if static_analysis else "")
-    return (CORE.format(scope=_scope(bug_classes), threat=threat_text(threat_model))
+    return (CORE.format(scope=_scope(bug_classes), threat=threat_text(threat_model),
+                        stance=stance_text, closing=closing)
             + "\n\n" + mode)
 
 
@@ -253,5 +275,5 @@ def prompt_fingerprint() -> str:
     """Hash of every prompt template, saved with each run for reproducibility."""
     blob = "".join([CORE, EXPLORE_MODE, EXPLORE_SA, FIXED_MODE, FIXED_SA,
                     VALIDATOR_HEAD, repr(EVIDENCE_INSTRUCTIONS), repr(EVIDENCE),
-                    repr(THREAT_MODELS)])
+                    repr(THREAT_MODELS), repr(STANCES)])
     return hashlib.sha256(blob.encode()).hexdigest()[:12]

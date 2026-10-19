@@ -32,6 +32,9 @@ def main():
     ap.add_argument("--threat-model", default="remote", choices=["remote", "all-external"],
                     help="remote: realistic web attacker (default for real repos); "
                          "all-external: every outside input is tainted (Juliet)")
+    ap.add_argument("--stance", default="precise", choices=["precise", "screen"],
+                    help="screen: report anything plausible (recall first) for a "
+                         "verifier to check")
     ap.add_argument("--no-validate", action="store_true")
     ap.add_argument("--context", action="store_true",
                     help="build architectural context before hunting (ToB-style)")
@@ -46,7 +49,7 @@ def main():
     p = PRESETS[a.preset]
     cfg = replace(p.audit, model=a.model, bug_classes=tuple(a.bugs), unit=a.unit,
                   context_budget=a.budget, max_turns=a.max_turns, effort=a.effort,
-                  threat_model=a.threat_model)
+                  threat_model=a.threat_model, stance=a.stance)
     val = ValidationConfig() if a.no_validate else p.validation
     res = audit_repo(a.repo, cfg, workers=a.workers, validation=val,
                      use_context=a.context, use_variants=a.variants)

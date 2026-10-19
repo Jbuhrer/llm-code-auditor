@@ -13,12 +13,18 @@ KEYWORDS = {
     "path": ["java.io.File", "new File(", "Paths.get(", "Path.of(", "FileInputStream",
              "FileOutputStream", "FileReader", "FileWriter", "ZipEntry", "ZipFile",
              "getResource", ".resolve(", "Files."],
-    "cmdi": ["Runtime.getRuntime", "ProcessBuilder", ".exec(", "Commandline", "CommandLine"],
+    "cmdi": ["Runtime.getRuntime", "ProcessBuilder", ".exec(", "Commandline", "CommandLine",
+             # Jenkins and commons-exec run processes without ProcessBuilder in sight
+             "ArgumentListBuilder", "Launcher", "ProcStarter", "DefaultExecutor"],
     "xss": ["HttpServletResponse", "getWriter(", "PrintWriter", "ResponseBody", "html",
-            "Html", "escape", "Escape", "sanitize", "Sanitize", "Policy"],
+            "Html", "escape", "Escape", "sanitize", "Sanitize", "Policy",
+            "getParameter", "JspWriter", "sendRedirect", "Markup"],
     "codei": ["ScriptEngine", "ExpressionParser", "Expression", "Ognl", "OGNL",
               "ELProcessor", "ValueStack", "Class.forName", "defineClass", "MVEL",
-              "Velocity", "freemarker", "Freemarker", "groovy", "Groovy", "eval("],
+              "Velocity", "freemarker", "Freemarker", "groovy", "Groovy", "eval(",
+              # CWE-94 in CWE-Bench-Java also covers deserialization and JNDI RCE
+              "Yaml", "ObjectInputStream", "readObject", "XStream", "fromXML",
+              "parseObject", "Hessian", "InitialContext", "Nashorn"],
 }
 TEST_PATH = re.compile(r"(^|/)(src/test|test|tests|testing|it)/|Test[s]?\.java$")
 
@@ -44,3 +50,18 @@ def keep(text: str, classes: list[str]) -> bool:
     if not words or any(c not in KEYWORDS for c in classes):
         return True
     return any(w in text for w in words)
+
+
+def drop_reason(inner: str, text: str, classes: list[str],
+                exts: tuple[str, ...] = (".java",)) -> str | None:
+    """Why build_project_units would skip this file (path relative to its
+    project), or None if it is kept. Same order of checks as the unit builder."""
+    if not inner.endswith(exts):
+        return f"not a {'/'.join(exts)} file"
+    if is_test(inner):
+        return "test path"
+    if is_non_product(inner):
+        return "docs/sample/example path"
+    if not keep(text, classes):
+        return "no keyword for " + "/".join(classes)
+    return None

@@ -221,3 +221,42 @@ def test_failed_fetch_leaves_no_partial_folder(tmp_path, monkeypatch):
     p = Project("s__p_CVE-2020-1_1", "CVE-2020-1", "CWE-22", "u", "t", "c", [], "")
     assert fetch_project(p, tmp_path) == (False, "could not fetch commit or tag")
     assert not (tmp_path / p.slug).exists()
+
+
+def test_prefilter_keeps_indirect_sinks():
+    """Sinks that never name ProcessBuilder or ScriptEngine: Jenkins launchers,
+    YAML/object deserialization, JSP output."""
+    from auditor.prefilter import keep, drop_reason
+    assert keep("new ArgumentListBuilder().add(image)", ["cmdi"])
+    assert keep("new Yaml().load(rule)", ["codei"])
+    assert keep("new ObjectInputStream(in).readObject()", ["codei"])
+    assert keep("out.print(request.getParameter(\"q\"))", ["xss"])
+    assert drop_reason("src/main/java/A.java", "int x = 1;", ["cmdi"]) == "no keyword for cmdi"
+    assert drop_reason("src/test/java/A.java", "", ["cmdi"]) == "test path"
+    assert drop_reason("src/main/java/A.java", "Runtime.getRuntime()", ["cmdi"]) is None
+
+
+def test_prefilter_check_names_the_reason(tmp_path):
+    import json
+    from eval.prefilter_check import check
+    (tmp_path / "p1/src/main/java").mkdir(parents=True)
+    (tmp_path / "p1/src/main/java/A.java").write_text("class A {\n  void f() {\n    x();\n  }\n}\n")
+    (tmp_path / "p1/src/main/java/B.java").write_text("class B { Runtime.getRuntime(); }\n")
+    labels = [{"file": "p1/src/main/java/A.java", "line": 2, "cve": "CVE-1", "method": "f",
+               "bug_class": "cmdi"},
+              {"file": "p1/src/main/java/B.java", "line": 1, "cve": "CVE-2", "method": "g",
+               "bug_class": "cmdi"}]
+    out = check(tmp_path, labels, ["cmdi"])
+    assert out.startswith("1 of 2 CVEs") and "CVE-1" in out and "CVE-2" not in out
+    assert "no keyword for cmdi" in out and "void f()" in out
+
+
+def test_screen_stance_changes_only_the_reporting_bar():
+    from auditor.prompts import system_prompt
+    precise = system_prompt(["cmdi"], True, False)
+    screen = system_prompt(["cmdi"], True, False, stance="screen")
+    assert "Precision matters more than recall" in precise
+    assert "SCREENING pass" in screen and "Precision matters more" not in screen
+    from auditor.config import AuditConfig
+    assert AuditConfig(stance="screen").cell().endswith("-screen")
+    assert AuditConfig().cell() == "explore-sa"

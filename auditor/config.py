@@ -43,11 +43,13 @@ class AuditConfig:
     threat_model: str = "all-external"   # see prompts.THREAT_MODELS
     unit: str = "file"                    # "file" | "testcase" | "repo"
     bug_classes: tuple[str, ...] = ("sqli", "cmdi", "path")
+    stance: str = "precise"               # "precise" | "screen", see prompts.STANCES
 
     def cell(self) -> str:
         """Short, filesystem-safe name for this audit cell."""
         sa = "sa" if self.static_analysis else "nosa"
-        return f"{self.exploration}-{sa}"
+        return f"{self.exploration}-{sa}" + ("" if self.stance == "precise"
+                                             else f"-{self.stance}")
 
     def as_dict(self):
         return asdict(self)
