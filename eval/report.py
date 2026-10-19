@@ -114,6 +114,9 @@ def main():
     a = ap.parse_args()
 
     root = Path(a.run_dir)
+    if not (root / "meta.json").exists():
+        sys.exit(f"no results in {root} yet (meta.json missing). A --dry-run only "
+                 "counts units; run experiment.py without it first.")
     meta = json.loads((root / "meta.json").read_text())
     labels = json.loads(Path(meta["labels"]).read_text())
     repo = meta["repo"]
