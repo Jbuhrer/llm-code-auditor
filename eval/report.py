@@ -132,9 +132,10 @@ def main():
     # real CVEs: precision is unknowable without triage, so show what is measurable
     mid = ("file recall | alerts/project | off-target" if mode == "method"
            else "precision | FP rate | finding FDR | localization")
-    md.append("| preset | model | cell | validation | runs | recall | " + mid +
-              " | tokens | $ | $/TP | sec | refusals | errors |")
-    md.append("|" + "---|" * 16)
+    head = ("| preset | model | cell | validation | runs | recall | " + mid +
+            " | tokens | $ | $/TP | sec | refusals | errors |")
+    md.append(head)
+    md.append("|" + "---|" * (head.count("|") - 1))   # 15 cols in method mode, 16 else
     case_runs: dict[tuple, list[dict]] = {}
     def order(key):
         ps = names.get(key, [])
