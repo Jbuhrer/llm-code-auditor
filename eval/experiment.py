@@ -33,7 +33,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from auditor.agent import Auditor, FatalBackendError                # noqa: E402
+from auditor.agent import Auditor, FatalBackendError, is_fatal_msg                # noqa: E402
 from auditor.baseline import semgrep_baseline                       # noqa: E402
 from auditor.budget import Budget, BudgetExceeded                   # noqa: E402
 from auditor.config import (AuditConfig, ValidationConfig, PRESETS,  # noqa: E402
@@ -169,16 +169,26 @@ def plan_cells(a, base: AuditConfig) -> list[dict]:
 
 def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
     path = out_dir / "audit.json"
-    if path.exists():
+    part = out_dir / "audit.partial.jsonl"
+    prior = json.loads(path.read_text())["units"] if path.exists() else read_jsonl(part)
+    # units that errored (rate limit, out of credits, outage) are retried, not kept
+    done = {r["unit"]: r for r in prior if not r.get("error")}
+    if path.exists() and len(done) == len(units):
         log(f"  (have {path}, skipping)")
         return json.loads(path.read_text())
+    if prior:
+        log(f"  resuming: {len(done)} unit(s) done, {len(prior) - len(done)} "
+            f"errored unit(s) will be retried")
+    if path.exists():   # rebuild it from the good records plus the retries
+        for r in done.values():
+            append_jsonl(part, r)
+        path.unlink()
+        for f in out_dir.iterdir():   # validation is indexed by finding, now stale
+            if f.name not in ("audit.json", part.name) and f.suffix in (".json", ".jsonl"):
+                f.unlink()
     cfg: AuditConfig = cell["audit"]
     backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
     t0 = time.monotonic()
-    part = out_dir / "audit.partial.jsonl"
-    done = {r["unit"]: r for r in read_jsonl(part)}
-    if done:
-        log(f"  resuming: {len(done)} unit(s) already done")
     lock = threading.Lock()
 
     def save(rec):
@@ -209,7 +219,8 @@ def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
 
 def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> None:
     path = out_dir / f"{vcfg.name()}.json"
-    if path.exists():
+    if path.exists() and not any(r.get("error") for r in
+                                 json.loads(path.read_text())["records"]):
         return
     cfg: AuditConfig = cell["audit"]
     backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
@@ -217,15 +228,27 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     log(f"  validating {len(findings)} finding(s) with {vcfg.name()}")
     t0 = time.monotonic()
     part = out_dir / f"{vcfg.name()}.partial.jsonl"
-    done = {e["i"]: e["rec"] for e in read_jsonl(part)}
+    prior = ([{"i": i, "rec": r} for i, r in
+              enumerate(json.loads(path.read_text())["records"])]
+             if path.exists() else read_jsonl(part))
+    done = {e["i"]: e["rec"] for e in prior if not e["rec"].get("error")}
+    if path.exists():
+        for i, r in done.items():
+            append_jsonl(part, {"i": i, "rec": r})
+        path.unlink()
     unit_files = {u["unit"]: u["targets"] for u in audit["units"]}
     lock = threading.Lock()
 
+    stop = []
+
     def one(i):
-        if a.spend.exceeded:
+        if a.spend.exceeded or stop:
             return
         rec = validate_one(backend, ws, dict(findings[i]), vcfg, cfg.threat_model,
                            unit_files.get(findings[i].get("unit")))
+        if rec.get("error") and is_fatal_msg(rec["error"]):
+            stop.append(rec["error"])
+            raise FatalBackendError(rec["error"])
         a.spend.add(cost_usd(cfg.model, rec["usage"]))
         with lock:
             append_jsonl(part, {"i": i, "rec": rec})

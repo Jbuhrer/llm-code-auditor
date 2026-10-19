@@ -37,8 +37,24 @@ MAX_TOKENS = 16000   # per model call; thinking models need headroom
 FATAL_ERRORS = {"AuthenticationError", "PermissionDeniedError", "NotFoundError"}
 
 
+ERROR_STREAK = 10   # identical consecutive unit errors before the pass stops
+
+
 class FatalBackendError(RuntimeError):
     pass
+
+
+def is_fatal(e: Exception) -> bool:
+    """True for errors that will hit every remaining call the same way."""
+    return is_fatal_msg(f"{type(e).__name__}: {e}")
+
+
+def is_fatal_msg(msg: str) -> bool:
+    if msg.split(":", 1)[0] in FATAL_ERRORS:
+        return True
+    low = msg.lower()
+    # out of credits comes back as a 400 BadRequestError, not an auth error
+    return "credit balance" in low or "billing" in low
 
 
 @dataclass
@@ -99,10 +115,25 @@ class Auditor:
             except Exception as e:
                 log(f"  ! semgrep unavailable: {e}")
 
+        fatal: list[FatalBackendError] = []
+        streak = {"msg": None, "n": 0}
+        lock = threading.Lock()
+
         def one(u, i):
-            if should_stop is not None and should_stop():
+            if fatal or (should_stop is not None and should_stop()):
                 return None
-            rec = self._run_logged(u, i, len(units), log)
+            try:
+                rec = self._run_logged(u, i, len(units), log)
+            except FatalBackendError as e:
+                fatal.append(e)
+                return None
+            with lock:   # the same error many times in a row means the backend is down
+                msg = (rec["error"] or "")[:120] or None
+                streak["n"] = streak["n"] + 1 if msg and msg == streak["msg"] else int(bool(msg))
+                streak["msg"] = msg
+                if streak["n"] >= ERROR_STREAK:
+                    fatal.append(FatalBackendError(
+                        f"{ERROR_STREAK} units in a row failed with: {msg}"))
             if on_done is not None:
                 on_done(rec)
             return rec
@@ -116,6 +147,8 @@ class Auditor:
                 futs = {pool.submit(one, u, i): i for i, u in enumerate(units)}
                 for fut in as_completed(futs):
                     out[futs[fut]] = fut.result()
+        if fatal:
+            raise fatal[0]
         return [r for r in out if r is not None]
 
     def run_unit(self, unit: Unit) -> dict:
@@ -129,7 +162,7 @@ class Auditor:
             else:
                 self._fixed(unit, rec)
         except Exception as e:  # one unit failing must not kill the run...
-            if type(e).__name__ in FATAL_ERRORS:   # ...unless it will fail them all
+            if is_fatal(e):   # ...unless it will fail them all
                 raise FatalBackendError(f"{type(e).__name__}: {str(e)[:300]}") from e
             rec["error"] = f"{type(e).__name__}: {str(e)[:300]}"
         rec["seconds"] = round(time.monotonic() - t0, 2)

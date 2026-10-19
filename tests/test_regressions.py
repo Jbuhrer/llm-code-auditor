@@ -245,3 +245,82 @@ def test_zero_padded_cwe_ids(cwe, cls):
     """CWE-Bench-Java writes CWE-094; it must map the same as CWE-94."""
     from auditor.classes import canonical_class
     assert canonical_class({"cwe": cwe}) == cls
+
+
+def test_out_of_credits_stops_the_pass(toy_repo):
+    """Running out of credits is a 400 BadRequestError, not an auth error. It
+    used to be recorded per unit, so a run burned through thousands of units
+    that all failed the same way."""
+    root, _ = toy_repo
+    ws = Workspace(str(root))
+
+    class BadRequestError(Exception):
+        pass
+
+    def broke(conv):
+        raise BadRequestError("Error code: 400 - {'type': 'error', 'error': {'type': "
+                              "'invalid_request_error', 'message': 'Your credit balance "
+                              "is too low to access the Anthropic API.'}}")
+    with pytest.raises(FatalBackendError):
+        Auditor(ws, AuditConfig(), FakeBackend(broke)).run_units(
+            build_units(ws, "file"), workers=1, log=lambda m: None)
+
+
+def test_error_streak_stops_the_pass(tmp_path):
+    """An unknown error repeating on every unit (an outage) stops the pass
+    instead of running through the rest of the benchmark."""
+    import auditor.agent as ag
+    for i in range(ag.ERROR_STREAK + 5):
+        (tmp_path / f"f{i}.py").write_text("x = 1\n")
+    ws = Workspace(str(tmp_path))
+    calls = []
+
+    def down(conv):
+        calls.append(1)
+        raise RuntimeError("upstream connect error")
+    with pytest.raises(FatalBackendError):
+        Auditor(ws, replace(AuditConfig(), static_analysis=False), FakeBackend(down)
+                ).run_units(build_units(ws, "file"), workers=1, log=lambda m: None)
+    assert len(calls) == ag.ERROR_STREAK
+
+
+def test_errored_units_are_retried_on_resume(tmp_path, monkeypatch):
+    """A finished audit.json with errored units gets those units re-run on the
+    next invocation; good units are not paid for twice."""
+    import json
+    import sys
+    import eval.experiment as ex
+    from tests.conftest import report
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for n in ("a", "b", "c"):
+        (repo / f"{n}.py").write_text("x = 1\n")
+    labels = tmp_path / "labels.json"
+    labels.write_text(json.dumps([{"file": "a.py", "line": 1, "bug_class": "sqli"}]))
+    out = tmp_path / "res"
+    calls = []
+    flaky = {"on": True}
+
+    def backend(*_a, **_k):
+        def script(conv):
+            calls.append(1)
+            if flaky["on"] and len(calls) == 2:
+                raise RuntimeError("overloaded")
+            return report([])
+        return FakeBackend(script)
+
+    monkeypatch.setattr(ex, "make_backend", backend)
+    monkeypatch.setattr(sys, "argv", [
+        "experiment.py", str(repo), str(labels), "--configs", "C0", "--runs", "1",
+        "--unit", "file", "--no-baseline", "--workers", "1", "--skip-preflight",
+        "--out", str(out)])
+    ex.main()
+    run = out / "claude-opus-5-5" / "fixed-nosa" / "run1"
+    units = json.loads((run / "audit.json").read_text())["units"]
+    assert sum(bool(u["error"]) for u in units) == 1 and len(calls) == 3
+
+    flaky["on"] = False
+    ex.main()
+    units = json.loads((run / "audit.json").read_text())["units"]
+    assert not any(u["error"] for u in units) and len(units) == 3
+    assert len(calls) == 4   # only the errored unit was re-run
