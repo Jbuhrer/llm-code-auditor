@@ -77,6 +77,14 @@ Next:
    Validator removed 0 FPs (none exist) and lost 0-3 TP cases per variant. ~90% of its rejections are Runtime.exec(String) no-shell arguments: right for the /bin/ls branch, wrong for Juliet's Windows cmd.exe /c branch (platform-branch reasoning failure, RO2).
    CONFIRMED Juliet ground-truth flaw: every database-source file in the slice (6 of 6) calls resultSet.getString(1) right after executeQuery() with no resultSet.next(). Per JDBC the cursor starts before the first row, so getString throws SQLException and the tainted value never reaches the sink at runtime. The validator caught this on its own.
    Tentative: plain verdict rejected the most TPs; structured evidence fewer. Re-check on CWE-Bench-Java.
+   CWE-Bench-Java v1, 40 CVEs (seed 0, 10 per CWE 22/78/79/94, max 300 files), Haiku, 1 run, results/cbj-v1-n10-haiku* on Kali:
+   - Precise stance (prompt v4): C0 recall 0.371 ($0.84/TP), C2 0.257 ($0.44/TP), C0 vs C2 p=0.22. Semgrep 0.057.
+   - Screen stance (prompt v5, --stance screen), C2: recall 0.526, file recall 0.553, $0.27/TP, but 43 alerts/project (vs 7.7).
+     On the 34 CVEs both runs could reach: precise 9, screen 18, discordant 9 vs 0 (exact McNemar p~0.004).
+     The 2 other extra catches came from the pre-filter fix. Reporting stance moved recall more than any scaffolding component. Candidate headline with the threat-model result.
+   - Label path bug fixed (fix-commit path missing at the vulnerable commit, e.g. Dubbo com.alibaba -> org.apache): benchmarks/fix_label_paths.py.
+   - Pre-filter reaches 37/40 CVEs. Unreachable: CVE-2018-1260 (label points at a token-header method, likely label noise), CVE-2022-20617 and CVE-2023-37582 (sink is elsewhere, no keyword can catch it).
+   - Next: Opus verifier over the screen run's flags (Haiku -> Opus cascade). ~1600 flags, too costly on the $50/month budget; needs LSU plan or a cheaper triage stage.
 2. Pin a semgrep ruleset for thesis runs.
 3. CWE-Bench-Java loader (next build) and an open-weight model setup.
 4. RO4 edits and real-repo runs.
