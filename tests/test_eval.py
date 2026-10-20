@@ -201,3 +201,13 @@ def test_experiment_and_report_offline(juliet_repo, tmp_path, monkeypatch, capsy
     assert any(t["a"] == "C3" and t["b"] == "C4" for t in rep["mcnemar"])
     assert rep["ro2"] and rep["ro2"][0]["tp_cases_lost"] == 0
     assert "surviving_fps" in rep   # the good-side finding survived the fake validator
+
+
+def test_compare_splits_shared_and_new_reach():
+    from eval.compare import compare
+    a = ({"cell": "x"}, {"C1"}, {"C1", "C2"})
+    b = ({"cell": "y"}, {"C1", "C2", "C3"}, {"C1", "C2", "C3"})
+    out = compare(a, b)
+    assert "reachable by both: 2 CVEs" in out
+    assert "A caught 1, B caught 2 (B only: ['C2']" in out
+    assert "only B could reach: ['C3']" in out

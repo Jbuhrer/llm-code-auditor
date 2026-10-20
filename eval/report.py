@@ -179,6 +179,9 @@ def main():
                            "finding_fdr": fdr, "localization": loc, "tokens": toks,
                            "cost_usd": cost, "cost_per_tp": cpt, "seconds": sec,
                            "refusals": refus, "errors": errs,
+                           "hits": sorted({c for r in runs for c, v in
+                                           r["score"].get("cases", {}).items()
+                                           if v.get("hit")}),
                            "per_run": [{k: r["score"][k] for k in r["score"] if k != "cases"}
                                        for r in runs]})
 
