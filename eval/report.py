@@ -22,7 +22,7 @@ from statistics import median
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from auditor.pricing import cost_usd, records_cost         # noqa: E402
-from eval.metrics import score, default_mode, _name        # noqa: E402
+from eval.metrics import score, default_mode, finding_cves, _name  # noqa: E402
 from eval.juliet_functions import locate                   # noqa: E402
 from eval.stats import bootstrap_ci, majority, mcnemar     # noqa: E402
 
@@ -334,6 +334,41 @@ def main():
             if len(lost) > 40:
                 md.append(f"\n({len(lost) - 40} more in report.json)")
             js["validator_lost_tps"] = lost
+
+    if mode == "method":
+        # CVEs the raw run caught and the validator lost, with every on-target
+        # flag it rejected for them and its stated reason
+        lost = []
+        for (model, cell, val), runs in sorted(rows.items()):
+            base = {r["run"]: r for r in rows.get((model, cell, "noval"), [])}
+            if val == "noval":
+                continue
+            for r in runs:
+                b = base.get(r["run"])
+                if not b:
+                    continue
+                gone = {k for k, c in b["score"]["cases"].items() if c["hit"]
+                        and not r["score"]["cases"].get(k, {}).get("hit")}
+                if not gone:
+                    continue
+                cves = finding_cves(r["findings"], r["labels"], repo)
+                for f, rec, fc in zip(r["findings"], r["val_records"], cves):
+                    for cve in sorted(gone & set(fc)):
+                        reason = str((rec.get("verdict") or {}).get("reason", "")).strip()
+                        lost.append({"model": model, "validation": val, "run": r["run"],
+                                     "cve": cve, "where": f"{f['file']}:{f.get('line')}",
+                                     "rejected_by": rec["rejected_by"],
+                                     "reason": reason or rec.get("error") or ""})
+        if lost:
+            md.append("\n## RO2: CVEs the validator lost, and why\n")
+            md.append("| validation | CVE | flag | rejected by | validator's reason |")
+            md.append("|" + "---|" * 5)
+            for x in lost[:40]:
+                md.append(f"| {x['validation']} | {x['cve']} | {x['where']} | "
+                          f"{', '.join(x['rejected_by'])} | {x['reason'][:300]} |")
+            if len(lost) > 40:
+                md.append(f"\n({len(lost) - 40} more in report.json)")
+            js["validator_lost_cves"] = lost
 
     # ------------------------------------------------------------ strata
     strata = {}

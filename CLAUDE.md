@@ -84,7 +84,11 @@ Next:
      The 2 other extra catches came from the pre-filter fix. Reporting stance moved recall more than any scaffolding component. Candidate headline with the threat-model result.
    - Label path bug fixed (fix-commit path missing at the vulnerable commit, e.g. Dubbo com.alibaba -> org.apache): benchmarks/fix_label_paths.py.
    - Pre-filter reaches 37/40 CVEs. Unreachable: CVE-2018-1260 (label points at a token-header method, likely label noise), CVE-2022-20617 and CVE-2023-37582 (sink is elsewhere, no keyword can catch it).
-   - Next: Claude verifier over the screen run's ~1,700 flags (Haiku -> Sonnet/Opus cascade). The LSU token program turned out to be Codex only (no API key), so this is paid out of pocket. Plan: 50-flag pilot of Sonnet 5.5 and Opus 5.5 on the same flags (`--verify-sample 50 --batch`, summarize with `eval/pilot.py`), then the full run on whichever is cheaper at similar agreement. Estimate for the full run: Sonnet ~$20-55, Opus ~$40-110 at batch prices (token guess, the pilot measures it).
+   - Cascade (Haiku screen -> Claude verifier, all evidence items, Message Batches). The LSU token program turned out to be Codex only (no API key), so this was paid out of pocket.
+     Pilot, same 50 flags (25 on labelled bugs): Sonnet 5.5 kept 22/25 real-bug flags, rejected 21/25 off-target, $0.49; Opus 5.5 kept 22/25, rejected 19/25, $1.26; they agree on 44/50. Sonnet chosen.
+     Full run, Sonnet over all 1,633 flags ($15.55, ~8 min as a batch): recall 0.526 -> 0.474 (20 -> 18 CVEs, CIs overlap), alerts/project 43.0 -> 13.6, off-target 1,581 -> 468, $1.17/TP all in ($20.98 total). Lost CVE-2020-5405 and CVE-2022-28367 (reasons in the report's "CVEs the validator lost" table).
+     Vs precise C2 (0.257, 7.7 alerts/project): ~1.8x the recall at ~1.8x the alerts. Rejections: verdict 1,114, poc 1,108, conditions 448, sanitizer 108, path 26, refusal 1. Demanding a concrete input is nearly as strong a filter as the verdict itself (RO2).
+     Surviving off-target alerts aren't known FPs; they're also the zero-day candidate pool, but the projects are at old vulnerable commits, so check against current releases first.
 2. Pin a semgrep ruleset for thesis runs.
 3. CWE-Bench-Java loader (next build) and an open-weight model setup.
 4. RO4 edits and real-repo runs.

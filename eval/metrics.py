@@ -200,12 +200,17 @@ def finding_hits(findings, labels, mode, repo=None) -> list[bool]:
     as score_method; the other modes use line matching, which is close enough for
     picking a pilot sample but isn't the scoring rule."""
     if mode == "method":
-        targets: dict = {}
-        for l in labels:
-            targets.setdefault((l["file"], l["bug_class"]), []).append(
-                (l.get("cve") or l.get("project") or l["file"], l.get("method", "")))
-        return [bool(_method_match(f, targets, Path(repo))[1]) for f in findings]
+        return [bool(c) for c in finding_cves(findings, labels, repo)]
     return [any(matches(f, l) for l in labels) for f in findings]
+
+
+def finding_cves(findings, labels, repo) -> list[list[str]]:
+    """Per finding, the CVEs whose fixed method it hits (method scoring)."""
+    targets: dict = {}
+    for l in labels:
+        targets.setdefault((l["file"], l["bug_class"]), []).append(
+            (l.get("cve") or l.get("project") or l["file"], l.get("method", "")))
+    return [_method_match(f, targets, Path(repo))[1] for f in findings]
 
 
 def score(findings, labels, mode="testcase", repo=None):

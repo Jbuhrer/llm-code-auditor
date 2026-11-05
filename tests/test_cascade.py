@@ -146,3 +146,43 @@ def test_errored_batch_requests_are_retried(tmp_path, monkeypatch):
     assert [r["custom_id"] for r in batches.created[-1]] == ["f0"]   # only the failed one
     v = json.loads((run / "val-plain@claude-sonnet-5-5.json").read_text())
     assert not any(r["error"] for r in v["records"])
+
+
+def test_report_lists_cves_the_validator_lost(tmp_path, monkeypatch, capsys):
+    """Real-CVE runs: the report names each CVE the validator dropped, with the
+    rejected flag and the validator's reason."""
+    import eval.report as rp
+    from tests.test_cwe_bench_java import _project_repo
+    repo, labels = _project_repo(tmp_path)
+    lp = tmp_path / "labels.json"
+    lp.write_text(json.dumps(labels))
+    batches = FakeBatches()
+    batches.results = lambda bid: (NS(custom_id=r["custom_id"], result=NS(
+        type="succeeded", message=NS(
+            content=[NS(type="text", text=json.dumps(
+                {"verdict": "rejected", "reason": "name is checked upstream"}))],
+            stop_reason="end_turn", usage=_message().usage)))
+        for r in batches.created[-1])
+
+    def backend(model, *_a, **_k):
+        if model == "claude-sonnet-5-5":
+            return _backend(batches)
+        return FakeBackend(lambda conv: report([{"bug_class": "path", "line": 3,
+                                                 "file": "src/main/java/Files.java",
+                                                 "cwe": "CWE-22", "confidence": 0.9}]),
+                           model=model)
+
+    monkeypatch.setattr(ex, "make_backend", backend)
+    out = tmp_path / "res"
+    monkeypatch.setattr(sys, "argv", [
+        "experiment.py", str(repo), str(lp), "--configs", "C0", "--runs", "1",
+        "--bugs", "path", "--no-baseline", "--workers", "1", "--skip-preflight",
+        "--models", "claude-haiku-5-5", "--verifier-model", "claude-sonnet-5-5",
+        "--validation", "plain", "--batch", "--out", str(out)])
+    ex.main()
+    monkeypatch.setattr(sys, "argv", ["report.py", str(out), "--boot", "50"])
+    capsys.readouterr()
+    rp.main()
+    text = capsys.readouterr().out
+    assert "CVEs the validator lost" in text
+    assert "| CVE-2021-9 |" in text and "name is checked upstream" in text
