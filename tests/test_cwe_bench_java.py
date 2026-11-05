@@ -305,3 +305,11 @@ def test_keyword_stats_counts_sole_keepers(tmp_path):
     out = keyword_stats(tmp_path, [{"file": "p/src/A.java", "cve": "C1"}], ["cmdi"])
     assert "2 files kept" in out and "| `ProcessBuilder` | 1 | 2 |" in out
     assert "- C1: ProcessBuilder" in out
+
+
+def test_exclude_makes_a_held_out_pick(tmp_path):
+    ps = _data(tmp_path)
+    first = select(ps, ["22", "79"], 1, seed=0)
+    rest = select(ps, ["22", "79"], 0, seed=0, exclude={p.cve for p in first})
+    assert rest and not {p.cve for p in rest} & {p.cve for p in first}
+    assert len(rest) == len(select(ps, ["22", "79"], 0, seed=0)) - len(first)

@@ -93,10 +93,12 @@ def cve_year(cve: str) -> int | None:
 
 
 def pools(projects: dict[str, Project], cwes: list[str], seed: int,
-          min_year: int | None = None, only: list[str] | None = None) -> dict[str, list[Project]]:
+          min_year: int | None = None, only: list[str] | None = None,
+          exclude: set[str] | None = None) -> dict[str, list[Project]]:
     """Per CWE, every scorable project (one with ground truth) in seeded order.
     min_year keeps only CVEs from that year on (contamination control); only
-    restricts to slugs containing any of the given substrings."""
+    restricts to slugs containing any of the given substrings; exclude drops
+    these CVE ids (a held-out set that skips CVEs already used for tuning)."""
     import random
     rng = random.Random(seed)
     out = {}
@@ -104,7 +106,8 @@ def pools(projects: dict[str, Project], cwes: list[str], seed: int,
         pool = sorted((p for p in projects.values()
                        if p.cwe == cwe and p.methods
                        and (min_year is None or (cve_year(p.cve) or 0) >= min_year)
-                       and (not only or any(o in p.slug for o in only))),
+                       and (not only or any(o in p.slug for o in only))
+                       and p.cve not in (exclude or ())),
                       key=lambda p: p.slug)
         rng.shuffle(pool)
         out[cwe] = pool
@@ -112,10 +115,11 @@ def pools(projects: dict[str, Project], cwes: list[str], seed: int,
 
 
 def select(projects: dict[str, Project], cwes: list[str], per_cwe: int, seed: int,
-           min_year: int | None = None, only: list[str] | None = None) -> list[Project]:
+           min_year: int | None = None, only: list[str] | None = None,
+           exclude: set[str] | None = None) -> list[Project]:
     """Seeded, CWE-stratified pick: the first per_cwe of each pool (0 = all)."""
     picked = []
-    for pool in pools(projects, cwes, seed, min_year, only).values():
+    for pool in pools(projects, cwes, seed, min_year, only, exclude).values():
         picked += pool[:per_cwe] if per_cwe > 0 else pool
     return picked
 
@@ -282,6 +286,8 @@ def main():
     ap.add_argument("--min-year", type=int, default=None,
                     help="only CVEs from this year on (contamination control)")
     ap.add_argument("--only", nargs="*", default=None, help="slug substrings to keep")
+    ap.add_argument("--exclude", nargs="*", type=Path, default=[], metavar="LABELS_JSON",
+                    help="skip every CVE in these labels.json files (held-out set)")
     ap.add_argument("--out-dir", type=Path, default=None)
     ap.add_argument("--fetch", action="store_true", help="download the project sources")
     ap.add_argument("--list", action="store_true", help="print the pick, write nothing")
@@ -298,7 +304,10 @@ def main():
     here = Path(__file__).resolve().parent / "cwe_bench_java"
     data_dir = fetch_data(a.version, a.data_dir or here / "data" / a.version)
     projects = load_projects(data_dir)
-    picked = select(projects, a.cwes, a.per_cwe, a.seed, a.min_year, a.only)
+    exclude = {l["cve"] for p in a.exclude for l in json.loads(p.read_text()) if l.get("cve")}
+    if a.exclude:
+        print(f"excluding {len(exclude)} CVE(s) from {len(a.exclude)} labels file(s)")
+    picked = select(projects, a.cwes, a.per_cwe, a.seed, a.min_year, a.only, exclude)
     scorable = sum(1 for p in projects.values() if p.methods)
     print(f"{a.version}: {len(projects)} CVEs, {scorable} with ground truth; "
           + (f"{len(picked)} first candidates (the size cap may swap some; "
@@ -310,6 +319,7 @@ def main():
         return
 
     name = (f"{a.version}_s{a.seed}_n{a.per_cwe}" + (f"_y{a.min_year}" if a.min_year else "")
+            + ("_heldout" if a.exclude else "")
             + (f"_m{a.max_files}" if a.max_files else ""))
     out = a.out_dir or here / name
     proj_root = out / "projects"
@@ -318,7 +328,8 @@ def main():
     if a.max_files:
         import shutil
         picked = []
-        for cwe, pool in pools(projects, a.cwes, a.seed, a.min_year, a.only).items():
+        for cwe, pool in pools(projects, a.cwes, a.seed, a.min_year, a.only,
+                               exclude).items():
             took = 0
             for p in pool:
                 if a.per_cwe > 0 and took >= a.per_cwe:
