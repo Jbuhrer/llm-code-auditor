@@ -7,9 +7,9 @@ Model backends behind one small interface, so the model is just another factor.
 
 Backends:
   AnthropicBackend      any claude-* id, native tool use, prompt caching on
-  OpenAICompatBackend   "openai-compat:<model>" for open-weight models behind an
-                        OpenAI-compatible server (Ollama, vLLM, llama.cpp, TGI).
-                        Base URL from OPENAI_COMPAT_BASE_URL
+  OpenAICompatBackend   "openai-compat:<model>" for anything that speaks the OpenAI
+                        API: open-weight servers (Ollama, vLLM, llama.cpp, TGI) or
+                        hosted models. Base URL from OPENAI_COMPAT_BASE_URL
                         (default http://localhost:11434/v1, Ollama's).
 
 Tool schemas are written once in Anthropic's shape (tools.py) and translated here.
@@ -17,6 +17,7 @@ Tool schemas are written once in Anthropic's shape (tools.py) and translated her
 from __future__ import annotations
 import json
 import os
+import sys
 from dataclasses import dataclass, field
 
 REQUEST_TIMEOUT = 600   # seconds; thinking models can take a while on big units
@@ -127,12 +128,10 @@ class OpenAICompatConversation:
             self.messages.append({"role": "user", "content": note})
 
     def step(self, max_tokens: int) -> Reply:
-        kwargs = dict(model=self.b.model, messages=self.messages, max_tokens=max_tokens)
+        kwargs = dict(model=self.b.model, messages=self.messages)
         if self.tools:
             kwargs["tools"] = self.tools
-        if self.b.temperature is not None:
-            kwargs["temperature"] = self.b.temperature
-        resp = self.b.client.chat.completions.create(**kwargs)
+        resp = self.b.create(max_tokens, kwargs)
         msg = resp.choices[0].message
         calls, raw_calls = [], []
         for tc in msg.tool_calls or []:
@@ -149,18 +148,23 @@ class OpenAICompatConversation:
             entry["tool_calls"] = raw_calls
         self.messages.append(entry)
         u = resp.usage
-        usage = {"input": getattr(u, "prompt_tokens", 0) or 0,
+        cached = getattr(getattr(u, "prompt_tokens_details", None), "cached_tokens", 0) or 0
+        usage = {"input": (getattr(u, "prompt_tokens", 0) or 0) - cached,
                  "output": getattr(u, "completion_tokens", 0) or 0,
-                 "cache_read": 0, "cache_write": 0}
+                 "cache_read": cached, "cache_write": 0}
         stop = {"tool_calls": "tool_use", "stop": "end_turn",
                 "length": "max_tokens"}.get(resp.choices[0].finish_reason or "",
                                             resp.choices[0].finish_reason or "")
+        if getattr(msg, "refusal", None) or stop == "content_filter":
+            stop = "refusal"
         return Reply(msg.content or "", calls, stop, usage)
 
 
 class OpenAICompatBackend:
-    def __init__(self, model: str, temperature: float | None = 0.0, client=None):
-        self.model, self.temperature = model, temperature
+    def __init__(self, model: str, temperature: float | None = 0.0, client=None,
+                 effort: str | None = None):
+        self.model, self.temperature, self.effort = model, temperature, effort
+        self.token_param = "max_tokens"
         if client is None:
             from openai import OpenAI   # pip install openai; only needed for this backend
             client = OpenAI(base_url=os.environ.get("OPENAI_COMPAT_BASE_URL",
@@ -168,6 +172,35 @@ class OpenAICompatBackend:
                             api_key=os.environ.get("OPENAI_COMPAT_API_KEY", "unused"),
                             timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES)
         self.client = client
+
+    def create(self, max_tokens: int, kwargs: dict):
+        while True:
+            kw = {**kwargs, self.token_param: max_tokens}
+            if self.temperature is not None:
+                kw["temperature"] = self.temperature
+            if self.effort:
+                kw["reasoning_effort"] = self.effort
+            try:
+                return self.client.chat.completions.create(**kw)
+            except Exception as e:
+                if type(e).__name__ != "BadRequestError" or not self._adapt(str(e)):
+                    raise
+
+    def _adapt(self, msg: str) -> bool:
+        """Servers disagree on these three parameters, so learn from the first 400.
+        Each can only change once, so this can't loop. A dropped setting is no longer
+        held fixed by the experiment, so say so."""
+        if self.token_param == "max_tokens" and "max_tokens" in msg:
+            self.token_param = "max_completion_tokens"
+        elif self.temperature is not None and "temperature" in msg:
+            self.temperature = None
+            print(f"  ! {self.model} rejects temperature, using its default", file=sys.stderr)
+        elif self.effort and "reasoning_effort" in msg:
+            self.effort = None
+            print(f"  ! {self.model} rejects reasoning_effort, using its default", file=sys.stderr)
+        else:
+            return False
+        return True
 
     def conversation(self, system: str, tools: list[dict],
                      cache: bool = False) -> OpenAICompatConversation:
@@ -178,5 +211,6 @@ def make_backend(model: str, effort: str | None = None,
                  temperature: float | None = None):
     if model.startswith("openai-compat:"):
         return OpenAICompatBackend(model.split(":", 1)[1],
-                                   0.0 if temperature is None else temperature)
+                                   0.0 if temperature is None else temperature,
+                                   effort=effort)
     return AnthropicBackend(model, effort)

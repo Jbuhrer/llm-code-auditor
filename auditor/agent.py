@@ -53,8 +53,10 @@ def is_fatal_msg(msg: str) -> bool:
     if msg.split(":", 1)[0] in FATAL_ERRORS:
         return True
     low = msg.lower()
-    # out of credits comes back as a 400 BadRequestError, not an auth error
-    return "credit balance" in low or "billing" in low
+    # out of credits comes back as a 400 BadRequestError, not an auth error;
+    # OpenAI's version is a 429 that looks like a normal rate limit
+    return any(w in low for w in ("credit balance", "billing", "insufficient_quota",
+                                  "exceeded your current quota"))
 
 
 @dataclass

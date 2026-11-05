@@ -61,11 +61,13 @@ class ValidationConfig:
     evidence: tuple[str, ...] = ()        # empty + enabled = plain verdict validator
     window: int = 60                      # fallback: lines either side of the sink
     context_budget: int = 16000           # tokens of the finding's unit shown to the validator
+    model: str | None = None              # None = the model that did the audit
 
     def name(self) -> str:
         if not self.enabled:
             return "noval"
-        return "val-" + ("+".join(self.evidence) if self.evidence else "plain")
+        base = "val-" + ("+".join(self.evidence) if self.evidence else "plain")
+        return f"{base}@{self.model.replace(':', '_')}" if self.model else base
 
     def as_dict(self):
         return asdict(self)

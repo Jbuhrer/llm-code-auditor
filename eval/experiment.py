@@ -39,7 +39,7 @@ from auditor.budget import Budget, BudgetExceeded                   # noqa: E402
 from auditor.config import (AuditConfig, ValidationConfig, PRESETS,  # noqa: E402
                             full_factorial, validation_variants, EVIDENCE)
 from auditor.llm import make_backend                                # noqa: E402
-from auditor.pricing import cost_usd                                # noqa: E402
+from auditor.pricing import compat_server_is_local, cost_usd        # noqa: E402
 from auditor.prompts import PROMPT_VERSION, prompt_fingerprint, THREAT_MODELS  # noqa: E402
 from auditor.tools import Workspace, semgrep_exe                    # noqa: E402
 from auditor.units import build_units                               # noqa: E402
@@ -76,7 +76,7 @@ def semgrep_version() -> str:
         return f"error: {e}"
 
 
-def preflight(models: list[str]) -> list[str]:
+def preflight(models: list[str], max_usd: float | None = None) -> list[str]:
     """Problems that would make every call fail, caught before spending anything."""
     probs = []
     claude = [m for m in models if not m.startswith("openai-compat:")]
@@ -90,6 +90,12 @@ def preflight(models: list[str]) -> list[str]:
             import openai  # noqa: F401
         except ImportError:
             probs.append("openai-compat models need: pip install openai")
+        if not compat_server_is_local() and not os.environ.get("OPENAI_COMPAT_API_KEY"):
+            probs.append("hosted openai-compat server: set OPENAI_COMPAT_API_KEY")
+    unpriced = [m for m in models if cost_usd(m, {}) is None]
+    if max_usd is not None and unpriced:
+        probs.append(f"--max-usd can't count {', '.join(unpriced)}: no price entry in "
+                     "auditor/pricing.py, so the cap would never trip")
     return probs
 
 
@@ -142,6 +148,8 @@ def plan_cells(a, base: AuditConfig) -> list[dict]:
     extra_vals = validation_variants(a.validation) if a.validation else []
     if a.evidence_sweep:
         extra_vals += validation_variants(EVIDENCE_SWEEP)
+    retarget = lambda v: (replace(v, model=a.verifier_model)  # noqa: E731
+                          if v.enabled and a.verifier_model else v)
     wanted = []   # (label, audit_cfg, val_cfg)
     if a.factorial:
         for cfg in full_factorial(base):
@@ -156,10 +164,11 @@ def plan_cells(a, base: AuditConfig) -> list[dict]:
     for model in a.models:
         for label, cfg, val in wanted:
             cfg = replace(cfg, model=model)
+            val = retarget(val)
             key = (model, cfg.cell())
             cell = cells.setdefault(key, {"model": model, "audit": cfg, "labels": {},
                                           "validations": {}})
-            for v in [val] + extra_vals:
+            for v in [val] + [retarget(x) for x in extra_vals]:
                 if v.enabled:
                     cell["validations"][v.name()] = v
             if label:
@@ -223,7 +232,8 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
                                  json.loads(path.read_text())["records"]):
         return
     cfg: AuditConfig = cell["audit"]
-    backend = make_backend(cfg.model, cfg.effort, cfg.temperature)
+    model = vcfg.model or cfg.model
+    backend = make_backend(model, cfg.effort, cfg.temperature)
     findings = [f for u in audit["units"] for f in u["findings"]]
     log(f"  validating {len(findings)} finding(s) with {vcfg.name()}")
     t0 = time.monotonic()
@@ -249,7 +259,7 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
         if rec.get("error") and is_fatal_msg(rec["error"]):
             stop.append(rec["error"])
             raise FatalBackendError(rec["error"])
-        a.spend.add(cost_usd(cfg.model, rec["usage"]))
+        a.spend.add(cost_usd(model, rec["usage"]))
         with lock:
             append_jsonl(part, {"i": i, "rec": rec})
             done[i] = rec
@@ -264,8 +274,9 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     for r in recs:
         for k in total:
             total[k] += r["usage"].get(k, 0)
-    write_json(path, {"validation": vcfg.as_dict(), "records": recs, "usage": total,
-                      "cost_usd": cost_usd(cfg.model, total),
+    write_json(path, {"validation": vcfg.as_dict(), "model": model,
+                      "records": recs, "usage": total,
+                      "cost_usd": cost_usd(model, total),
                       "wall_seconds": round(time.monotonic() - t0, 2)})
     part.unlink(missing_ok=True)
 
@@ -284,6 +295,9 @@ def main():
     ap.add_argument("--validation", nargs="*", default=[],
                     help="extra validator variants on every audit cell: off, plain, "
                          "all, or items joined by + (path, sanitizer, conditions, poc)")
+    ap.add_argument("--verifier-model", default=None,
+                    help="validate with this model instead of the one that did the audit "
+                         "(a cascade); reuse an --out to check an existing run's findings")
     ap.add_argument("--evidence-sweep", action="store_true",
                     help="RO2: plain, each evidence item alone, and all")
     ap.add_argument("--unit", default=None,
@@ -340,7 +354,7 @@ def main():
           f"unit audits, plus validation calls per finding")
     if a.dry_run:
         return
-    probs = preflight(a.models)
+    probs = preflight(a.models + ([a.verifier_model] if a.verifier_model else []), a.max_usd)
     if probs and not a.skip_preflight:
         sys.exit("preflight failed:\n  " + "\n  ".join(probs))
 

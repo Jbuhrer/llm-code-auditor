@@ -78,14 +78,19 @@ def load_runs(root: Path, meta: dict, labels, mode, repo):
             s = score(findings, labs, mode, repo)
             rows.setdefault((model, ac, "noval"), []).append(
                 {**base, "score": s, "usage": audit["usage"],
+                 "cost": cost_usd(model, audit["usage"]),
                  "seconds": audit["wall_seconds"], "val": None})
             for vp in sorted(rdir.glob("val-*.json")):
                 v = json.loads(vp.read_text())
                 recs = v["records"]
                 kept = [f for f, r in zip(findings, recs) if r["confirmed"]]
+                # a cascade's validator isn't billed at the audit model's rates
+                costs = (cost_usd(model, audit["usage"]),
+                         cost_usd(v.get("model", model), v["usage"]))
                 rows.setdefault((model, ac, vp.stem), []).append({
                     **base, "score": score(kept, labs, mode, repo),
                     "usage": _sum_usage(audit["usage"], v["usage"]),
+                    "cost": None if None in costs else sum(costs),
                     "val_usage": v["usage"], "val_records": recs,
                     "seconds": audit["wall_seconds"] + v["wall_seconds"],
                     "val_errors": sum(bool(r["error"]) for r in recs),
@@ -155,7 +160,7 @@ def main():
                      else 1 - r["score"].get("finding_precision", 0) for r in runs)
         loc = median(r["score"].get("localization", 0) for r in runs)
         toks = median(_tokens(r["usage"]) for r in runs)
-        costs = [cost_usd(model, r["usage"]) for r in runs]
+        costs = [r["cost"] for r in runs]
         cost = median(costs) if None not in costs else None
         tps = [r["score"]["tp"] for r in runs]
         cpt = median(c / t for c, t in zip(costs, tps) if t) if cost is not None and any(tps) else None

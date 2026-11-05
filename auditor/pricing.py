@@ -7,9 +7,12 @@ run record, so dollars can always be recomputed with eval/report.py if a price
 changes. Cache writes are billed at 1.25x input (5 minute TTL).
 
 Open-weight models served locally cost $0 in API fees; set a price here if you
-rent GPUs and want to amortize it.
+rent GPUs and want to amortize it. A hosted openai-compat model has no price until
+it gets an entry here under its bare name (no "openai-compat:" prefix).
 """
 from __future__ import annotations
+import os
+from urllib.parse import urlparse
 
 # model: (input, output, cache_read)
 PRICES = {
@@ -25,12 +28,20 @@ PRICES = {
 CACHE_WRITE_MULT = 1.25
 
 
+def compat_server_is_local() -> bool:
+    url = os.environ.get("OPENAI_COMPAT_BASE_URL", "http://localhost:11434/v1")
+    return urlparse(url).hostname in ("localhost", "127.0.0.1", "::1")
+
+
 def cost_usd(model: str, usage: dict) -> float | None:
     """usage keys: input, output, cache_read, cache_write. None if the model has
     no price entry (so an unknown model never silently shows as free)."""
-    p = PRICES.get(model)
+    compat = model.startswith("openai-compat:")
+    p = PRICES.get(model.split(":", 1)[1] if compat else model)
     if p is None:
-        return 0.0 if model.startswith(("local:", "ollama:", "openai-compat:")) else None
+        if compat:
+            return 0.0 if compat_server_is_local() else None
+        return 0.0 if model.startswith(("local:", "ollama:")) else None
     inp, out, cread = p
     return round((usage.get("input", 0) * inp
                   + usage.get("output", 0) * out
