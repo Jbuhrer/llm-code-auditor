@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -33,18 +34,21 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from auditor.agent import Auditor, FatalBackendError, is_fatal_msg                # noqa: E402
+from auditor.agent import Auditor, FatalBackendError, is_fatal, is_fatal_msg      # noqa: E402
+from auditor.batch import run_batch                                 # noqa: E402
 from auditor.baseline import semgrep_baseline                       # noqa: E402
 from auditor.budget import Budget, BudgetExceeded                   # noqa: E402
 from auditor.config import (AuditConfig, ValidationConfig, PRESETS,  # noqa: E402
                             full_factorial, validation_variants, EVIDENCE)
 from auditor.llm import make_backend                                # noqa: E402
-from auditor.pricing import compat_server_is_local, cost_usd        # noqa: E402
+from auditor.pricing import (BATCH_DISCOUNT, compat_server_is_local,  # noqa: E402
+                             cost_usd, records_cost)
 from auditor.prompts import PROMPT_VERSION, prompt_fingerprint, THREAT_MODELS  # noqa: E402
 from auditor.tools import Workspace, semgrep_exe                    # noqa: E402
-from auditor.units import build_units                               # noqa: E402
-from auditor.validate import validate_one                           # noqa: E402
-from eval.metrics import default_mode                               # noqa: E402
+from auditor.units import build_units, est_tokens                   # noqa: E402
+from auditor.validate import (MAX_TOKENS as VALIDATE_MAX_TOKENS,    # noqa: E402
+                              finish_validation, prepare_validation, validate_one)
+from eval.metrics import default_mode, finding_hits                 # noqa: E402
 
 EVIDENCE_SWEEP = ["plain", *EVIDENCE, "all"]
 
@@ -226,21 +230,41 @@ def run_audit_pass(cell, run_k, ws, units, out_dir, a, log) -> dict:
     return data
 
 
+def pilot_sample(findings, labels, mode, repo, n: int, seed: int) -> list[int]:
+    """Indices of a seeded pilot sample: half on labelled bugs (so we can see how
+    many real bugs the verifier keeps), half off-target. Picked from the audit and
+    labels only, so every verifier model gets the same flags."""
+    hits = finding_hits(findings, labels, mode, repo)
+    on = [i for i, h in enumerate(hits) if h]
+    off = [i for i, h in enumerate(hits) if not h]
+    rng = random.Random(seed)
+    k = min(len(on), n // 2)
+    return sorted(rng.sample(on, k) + rng.sample(off, min(len(off), n - k)))
+
+
 def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> None:
-    path = out_dir / f"{vcfg.name()}.json"
+    findings = [f for u in audit["units"] for f in u["findings"]]
+    subset, stem = list(range(len(findings))), vcfg.name()
+    if getattr(a, "verify_sample", None):
+        subset = pilot_sample(findings, a.labels_data, a.mode, a.repo, a.verify_sample,
+                              a.sample_seed)
+        stem = f"pilot{a.verify_sample}-{stem}"   # report.py only reads val-*.json
+    path = out_dir / f"{stem}.json"
     if path.exists() and not any(r.get("error") for r in
                                  json.loads(path.read_text())["records"]):
         return
     cfg: AuditConfig = cell["audit"]
     model = vcfg.model or cfg.model
     backend = make_backend(model, cfg.effort, cfg.temperature)
-    findings = [f for u in audit["units"] for f in u["findings"]]
-    log(f"  validating {len(findings)} finding(s) with {vcfg.name()}")
+    log(f"  validating {len(subset)} of {len(findings)} finding(s) with {stem}")
     t0 = time.monotonic()
-    part = out_dir / f"{vcfg.name()}.partial.jsonl"
-    prior = ([{"i": i, "rec": r} for i, r in
-              enumerate(json.loads(path.read_text())["records"])]
-             if path.exists() else read_jsonl(part))
+    part = out_dir / f"{stem}.partial.jsonl"
+    if path.exists():
+        old = json.loads(path.read_text())
+        prior = [{"i": i, "rec": r} for i, r in
+                 zip(old.get("indices") or range(len(old["records"])), old["records"])]
+    else:
+        prior = read_jsonl(part)
     done = {e["i"]: e["rec"] for e in prior if not e["rec"].get("error")}
     if path.exists():
         for i, r in done.items():
@@ -264,21 +288,79 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
             append_jsonl(part, {"i": i, "rec": rec})
             done[i] = rec
 
-    todo = [i for i in range(len(findings)) if i not in done]
-    with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
-        list(pool.map(one, todo))
-    if len(done) < len(findings):
+    def save(i, rec):
+        with lock:
+            append_jsonl(part, {"i": i, "rec": rec})
+            done[i] = rec
+
+    todo = [i for i in subset if i not in done]
+    if getattr(a, "batch", False) and todo:
+        if model.startswith("openai-compat:"):
+            sys.exit("--batch is for Claude models (Message Batches)")
+        validate_batch(todo, findings, vcfg, cfg, ws, unit_files, backend, model,
+                       out_dir / f"{stem}.batch.json", a, log, save)
+    else:
+        with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
+            list(pool.map(one, todo))
+    if any(i not in done for i in subset):
         a.spend.check()   # stopped early: partial file stays for the next run
-    recs = [done[i] for i in range(len(findings))]
+    recs = [done[i] for i in subset]
     total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0}
     for r in recs:
         for k in total:
             total[k] += r["usage"].get(k, 0)
     write_json(path, {"validation": vcfg.as_dict(), "model": model,
+                      "indices": subset if stem != vcfg.name() else None,
                       "records": recs, "usage": total,
-                      "cost_usd": cost_usd(model, total),
+                      "cost_usd": records_cost(model, recs),
                       "wall_seconds": round(time.monotonic() - t0, 2)})
     part.unlink(missing_ok=True)
+
+
+def validate_batch(todo, findings, vcfg, cfg, ws, unit_files, backend, model, state,
+                   a, log, save) -> None:
+    """The same validation calls through Message Batches, at half price."""
+    pending, prompts = {}, {}
+    for i in todo:
+        rec, prompt, file = prepare_validation(ws, dict(findings[i]), vcfg, cfg.threat_model,
+                                               unit_files.get(findings[i].get("unit")))
+        if prompt is None:
+            save(i, rec)
+        else:
+            pending[i], prompts[f"f{i}"] = (rec, file), prompt
+    if not prompts:
+        return
+    est = sum(est_tokens(p) for p in prompts.values())
+    est_usd = cost_usd(model, {"input": est})
+    est_usd = None if est_usd is None else est_usd * BATCH_DISCOUNT
+    log(f"  {len(prompts)} request(s), ~{est:,} input tokens" +
+        ("" if est_usd is None else f", ~${est_usd:.2f} for input at batch price, plus output"))
+    if (not state.exists() and est_usd is not None and a.spend.limit is not None
+            and a.spend.spent + est_usd > a.spend.limit):
+        raise BudgetExceeded(f"the batch's input alone is ~${est_usd:.2f}, over what's "
+                             f"left of the ${a.spend.limit:.2f} cap")
+    try:
+        replies = run_batch(backend, prompts, VALIDATE_MAX_TOKENS, state, log)
+    except Exception as e:
+        if is_fatal(e):
+            raise FatalBackendError(f"{type(e).__name__}: {e}") from e
+        raise
+    fatal = None
+    for key, r in replies.items():
+        i = int(key[1:])
+        if i not in pending:
+            continue
+        rec, file = pending[i]
+        if isinstance(r, str):
+            rec["error"] = r
+            fatal = fatal or (r if is_fatal_msg(r) else None)
+        else:
+            rec = finish_validation(rec, r, ws, vcfg, file)
+            rec["price_mult"] = BATCH_DISCOUNT
+            a.spend.add(records_cost(model, [rec]))
+        save(i, rec)
+    if fatal:
+        raise FatalBackendError(fatal)
 
 
 def main():
@@ -298,6 +380,14 @@ def main():
     ap.add_argument("--verifier-model", default=None,
                     help="validate with this model instead of the one that did the audit "
                          "(a cascade); reuse an --out to check an existing run's findings")
+    ap.add_argument("--verify-sample", type=int, default=None, metavar="N",
+                    help="pilot: validate only a seeded sample of N findings (half on "
+                         "labelled bugs), saved as pilot<N>-*.json; summarize with "
+                         "eval/pilot.py")
+    ap.add_argument("--sample-seed", type=int, default=0)
+    ap.add_argument("--batch", action="store_true",
+                    help="send validation calls through Message Batches (half price, "
+                         "can take up to 24h; Ctrl-C and rerun resumes the same batch)")
     ap.add_argument("--evidence-sweep", action="store_true",
                     help="RO2: plain, each evidence item alone, and all")
     ap.add_argument("--unit", default=None,
@@ -332,6 +422,7 @@ def main():
     labels = json.loads(Path(a.labels).read_text())
     ws = Workspace(a.repo)
     mode = default_mode(labels)
+    a.labels_data, a.mode = labels, mode
     unit_mode = a.unit or {"function": "testcase", "method": "project-file"}.get(mode, "file")
     units = build_units(ws, unit_mode, list(a.bugs))
     if a.limit:

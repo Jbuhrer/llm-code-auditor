@@ -161,18 +161,18 @@ def validator_code(ws: Workspace, file: str, line: int, cfg: ValidationConfig,
     return "".join(parts), fallback
 
 
-def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
-                 threat_model: str = "all-external",
-                 unit_files: list[str] | None = None) -> dict:
-    """Returns a record: confirmed (bool), rejected_by, checks, verdict, usage,
-    seconds, and error/refusal if the call failed."""
+def prepare_validation(ws: Workspace, finding: dict, cfg: ValidationConfig,
+                       threat_model: str = "all-external",
+                       unit_files: list[str] | None = None) -> tuple[dict, str | None, str | None]:
+    """(record, prompt, resolved file). prompt is None when there's nothing to ask,
+    and the record is already final."""
     rec = {"confirmed": False, "rejected_by": [], "checks": {}, "verdict": None,
            "usage": empty_usage(), "seconds": 0.0, "error": None, "refused": False,
            "window_fallback": False}
     file = resolve_file(ws, str(finding.get("file", "")))
     if not file:
         rec["rejected_by"] = ["file_not_found"]
-        return rec
+        return rec, None, None
     try:
         line = int(finding.get("line", 1))
     except (TypeError, ValueError):
@@ -180,6 +180,17 @@ def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
     code, rec["window_fallback"] = validator_code(ws, file, line, cfg, unit_files)
     prompt = validator_prompt(json.dumps(finding, sort_keys=True), code, cfg.evidence,
                               threat_model)
+    return rec, prompt, file
+
+
+def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
+                 threat_model: str = "all-external",
+                 unit_files: list[str] | None = None) -> dict:
+    """Returns a record: confirmed (bool), rejected_by, checks, verdict, usage,
+    seconds, and error/refusal if the call failed."""
+    rec, prompt, file = prepare_validation(ws, finding, cfg, threat_model, unit_files)
+    if prompt is None:
+        return rec
     t0 = time.monotonic()
     try:
         conv = backend.conversation("", [])
@@ -190,6 +201,12 @@ def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
         rec["seconds"] = round(time.monotonic() - t0, 2)
         return rec
     rec["seconds"] = round(time.monotonic() - t0, 2)
+    return finish_validation(rec, reply, ws, cfg, file)
+
+
+def finish_validation(rec: dict, reply, ws: Workspace, cfg: ValidationConfig,
+                      file: str) -> dict:
+    """Turn the model's reply into the final record (refusal, parse, checks)."""
     rec["usage"] = reply.usage
     if reply.stop_reason == "refusal":
         rec["refused"] = True

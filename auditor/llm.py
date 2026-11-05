@@ -67,28 +67,22 @@ class AnthropicConversation:
         self.messages.append({"role": "user", "content": content})
 
     def step(self, max_tokens: int) -> Reply:
-        kwargs = dict(model=self.b.model, max_tokens=max_tokens, messages=self.messages)
-        if self.system:
-            kwargs["system"] = self.system
-        if self.cache:
-            # multi-turn loops resend a growing prefix; caching it is the big cost win.
-            # one-shot calls skip it, since a cache write costs 1.25x with no reuse.
-            kwargs["cache_control"] = {"type": "ephemeral"}
-        if self.tools:
-            kwargs["tools"] = self.tools
-        if self.b.effort:
-            kwargs["output_config"] = {"effort": self.b.effort}
+        kwargs = self.b.params(self.system, self.messages, max_tokens, self.tools, self.cache)
         resp = self.b.client.messages.create(**kwargs)
         # append the full content (thinking blocks included) so history stays valid
         self.messages.append({"role": "assistant", "content": resp.content})
-        u = resp.usage
-        usage = {"input": u.input_tokens or 0, "output": u.output_tokens or 0,
-                 "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
-                 "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0}
-        text = "".join(b.text for b in resp.content if b.type == "text")
-        calls = [ToolCall(b.id, b.name, dict(b.input))
-                 for b in resp.content if b.type == "tool_use"]
-        return Reply(text, calls, resp.stop_reason or "", usage)
+        return reply_from_message(resp)
+
+
+def reply_from_message(resp) -> Reply:
+    u = resp.usage
+    usage = {"input": u.input_tokens or 0, "output": u.output_tokens or 0,
+             "cache_read": getattr(u, "cache_read_input_tokens", 0) or 0,
+             "cache_write": getattr(u, "cache_creation_input_tokens", 0) or 0}
+    text = "".join(b.text for b in resp.content if b.type == "text")
+    calls = [ToolCall(b.id, b.name, dict(b.input))
+             for b in resp.content if b.type == "tool_use"]
+    return Reply(text, calls, resp.stop_reason or "", usage)
 
 
 class AnthropicBackend:
@@ -98,6 +92,22 @@ class AnthropicBackend:
             import anthropic
             client = anthropic.Anthropic(timeout=REQUEST_TIMEOUT, max_retries=MAX_RETRIES)
         self.client = client
+
+    def params(self, system: str, messages: list[dict], max_tokens: int,
+               tools: list[dict] | None = None, cache: bool = False) -> dict:
+        """One request's body, shared by live calls and Message Batches."""
+        kwargs = dict(model=self.model, max_tokens=max_tokens, messages=messages)
+        if system:
+            kwargs["system"] = system
+        if cache:
+            # multi-turn loops resend a growing prefix; caching it is the big cost win.
+            # one-shot calls skip it, since a cache write costs 1.25x with no reuse.
+            kwargs["cache_control"] = {"type": "ephemeral"}
+        if tools:
+            kwargs["tools"] = tools
+        if self.effort:
+            kwargs["output_config"] = {"effort": self.effort}
+        return kwargs
 
     def conversation(self, system: str, tools: list[dict],
                      cache: bool = False) -> AnthropicConversation:

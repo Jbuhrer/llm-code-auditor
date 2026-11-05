@@ -21,7 +21,7 @@ from pathlib import Path
 from statistics import median
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from auditor.pricing import cost_usd                       # noqa: E402
+from auditor.pricing import cost_usd, records_cost         # noqa: E402
 from eval.metrics import score, default_mode, _name        # noqa: E402
 from eval.juliet_functions import locate                   # noqa: E402
 from eval.stats import bootstrap_ci, majority, mcnemar     # noqa: E402
@@ -86,7 +86,7 @@ def load_runs(root: Path, meta: dict, labels, mode, repo):
                 kept = [f for f, r in zip(findings, recs) if r["confirmed"]]
                 # a cascade's validator isn't billed at the audit model's rates
                 costs = (cost_usd(model, audit["usage"]),
-                         cost_usd(v.get("model", model), v["usage"]))
+                         records_cost(v.get("model", model), recs))
                 rows.setdefault((model, ac, vp.stem), []).append({
                     **base, "score": score(kept, labs, mode, repo),
                     "usage": _sum_usage(audit["usage"], v["usage"]),

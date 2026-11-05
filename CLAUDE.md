@@ -84,7 +84,7 @@ Next:
      The 2 other extra catches came from the pre-filter fix. Reporting stance moved recall more than any scaffolding component. Candidate headline with the threat-model result.
    - Label path bug fixed (fix-commit path missing at the vulnerable commit, e.g. Dubbo com.alibaba -> org.apache): benchmarks/fix_label_paths.py.
    - Pre-filter reaches 37/40 CVEs. Unreachable: CVE-2018-1260 (label points at a token-header method, likely label noise), CVE-2022-20617 and CVE-2023-37582 (sink is elsewhere, no keyword can catch it).
-   - Next: Opus verifier over the screen run's flags (Haiku -> Opus cascade). ~1600 flags, too costly on the $50/month budget; needs LSU plan or a cheaper triage stage.
+   - Next: Claude verifier over the screen run's ~1,700 flags (Haiku -> Sonnet/Opus cascade). The LSU token program turned out to be Codex only (no API key), so this is paid out of pocket. Plan: 50-flag pilot of Sonnet 5.5 and Opus 5.5 on the same flags (`--verify-sample 50 --batch`, summarize with `eval/pilot.py`), then the full run on whichever is cheaper at similar agreement. Estimate for the full run: Sonnet ~$20-55, Opus ~$40-110 at batch prices (token guess, the pilot measures it).
 2. Pin a semgrep ruleset for thesis runs.
 3. CWE-Bench-Java loader (next build) and an open-weight model setup.
 4. RO4 edits and real-repo runs.

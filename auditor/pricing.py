@@ -26,6 +26,7 @@ PRICES = {
     "claude-haiku-4-5": (1.00, 5.00, 0.10),
 }
 CACHE_WRITE_MULT = 1.25
+BATCH_DISCOUNT = 0.5   # Message Batches bill every token at half price
 
 
 def compat_server_is_local() -> bool:
@@ -47,3 +48,15 @@ def cost_usd(model: str, usage: dict) -> float | None:
                   + usage.get("output", 0) * out
                   + usage.get("cache_read", 0) * cread
                   + usage.get("cache_write", 0) * inp * CACHE_WRITE_MULT) / 1e6, 6)
+
+
+def records_cost(model: str, records: list[dict]) -> float | None:
+    """Total for per-call records, each optionally carrying a price_mult (batch
+    calls are half price). None if the model has no price."""
+    total = 0.0
+    for r in records:
+        c = cost_usd(model, r.get("usage") or {})
+        if c is None:
+            return None
+        total += c * r.get("price_mult", 1)
+    return round(total, 6)

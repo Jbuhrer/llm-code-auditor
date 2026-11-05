@@ -160,19 +160,13 @@ def score_method(findings, labels, repo: str | Path):
 
     on_target, alerts = 0, Counter()
     for f in findings:
-        path = str(f.get("file", "")).replace("\\", "/")
-        alerts[path.split("/", 1)[0]] += 1
-        hits = targets.get((path, canonical_class(f)))
-        if not hits:
-            continue
-        fn, _ = locate(repo / path, _line(f))
-        matched = False
-        for cve, method in hits:
+        alerts[str(f.get("file", "")).replace("\\", "/").split("/", 1)[0]] += 1
+        in_file, hit = _method_match(f, targets, repo)
+        for cve in in_file:
             cases[cve]["file_hit"] = True
-            if not method or (fn and fn == method):
-                cases[cve]["hit"] = True
-                matched = True
-        on_target += matched
+        for cve in hit:
+            cases[cve]["hit"] = True
+        on_target += bool(hit)
 
     tp = sum(c["hit"] for c in cases.values())
     s = _prf(tp, 0, len(cases) - tp)
@@ -189,6 +183,29 @@ def score_method(findings, labels, repo: str | Path):
     })
     s.pop("fdr", None)   # unknowable without triage; see off_target_findings
     return s
+
+
+def _method_match(f: dict, targets: dict, repo: Path) -> tuple[list[str], list[str]]:
+    """(CVEs whose labelled file this finding is in, CVEs whose fixed method it hits)."""
+    path = str(f.get("file", "")).replace("\\", "/")
+    hits = targets.get((path, canonical_class(f)))
+    if not hits:
+        return [], []
+    fn, _ = locate(repo / path, _line(f))
+    return [c for c, _ in hits], [c for c, m in hits if not m or (fn and fn == m)]
+
+
+def finding_hits(findings, labels, mode, repo=None) -> list[bool]:
+    """Per finding: does it land on a labelled bug? Method mode uses the same rule
+    as score_method; the other modes use line matching, which is close enough for
+    picking a pilot sample but isn't the scoring rule."""
+    if mode == "method":
+        targets: dict = {}
+        for l in labels:
+            targets.setdefault((l["file"], l["bug_class"]), []).append(
+                (l.get("cve") or l.get("project") or l["file"], l.get("method", "")))
+        return [bool(_method_match(f, targets, Path(repo))[1]) for f in findings]
+    return [any(matches(f, l) for l in labels) for f in findings]
 
 
 def score(findings, labels, mode="testcase", repo=None):
