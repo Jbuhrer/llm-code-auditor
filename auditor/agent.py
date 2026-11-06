@@ -359,7 +359,7 @@ def audit_repo(repo: str, cfg: AuditConfig, backend=None, workers: int = 1,
                use_variants: bool = False) -> AuditResult:
     """Convenience wrapper: one cell over a whole repo, aggregated."""
     from .llm import make_backend
-    from .validate import validate_one
+    from .validate import scope_to_root, validate_one
     from .context import build_context
     backend = backend or make_backend(cfg.model, cfg.effort, cfg.temperature)
     ws = Workspace(repo)
@@ -383,11 +383,13 @@ def audit_repo(repo: str, cfg: AuditConfig, backend=None, workers: int = 1,
     res.units = len(recs)
     findings = [dict(f) for f in res.raw_findings]
     unit_files = {r["unit"]: r["targets"] for r in recs}
+    unit_roots = {r["unit"]: r.get("root") for r in recs}
     if validation is not None and validation.enabled:
         kept = []
         for f in findings:
-            v = validate_one(backend, ws, f, validation, cfg.threat_model,
-                             unit_files.get(f.get("unit")))
+            sws, sf, files = scope_to_root(ws, f, unit_files.get(f.get("unit")),
+                                           unit_roots.get(f.get("unit")))
+            v = validate_one(backend, sws, sf, validation, cfg.threat_model, files)
             add_usage(res.usage, v["usage"])
             if v["confirmed"]:
                 f["validator_reason"] = (v["verdict"] or {}).get("reason", "")

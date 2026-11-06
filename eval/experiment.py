@@ -47,7 +47,7 @@ from auditor.prompts import PROMPT_VERSION, prompt_fingerprint, THREAT_MODELS  #
 from auditor.tools import Workspace, semgrep_exe                    # noqa: E402
 from auditor.units import build_units, est_tokens                   # noqa: E402
 from auditor.validate import (MAX_TOKENS as VALIDATE_MAX_TOKENS,    # noqa: E402
-                              finish_validation, prepare_validation, validate_one)
+                              finish_validation, prepare_validation, validate_one, scope_to_root)
 from eval.metrics import default_mode, finding_hits                 # noqa: E402
 
 EVIDENCE_SWEEP = ["plain", *EVIDENCE, "all"]
@@ -271,6 +271,11 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
             append_jsonl(part, {"i": i, "rec": r})
         path.unlink()
     unit_files = {u["unit"]: u["targets"] for u in audit["units"]}
+    unit_roots = {u["unit"]: u.get("root") for u in audit["units"]}
+
+    def scoped(i):
+        u = findings[i].get("unit")
+        return scope_to_root(ws, dict(findings[i]), unit_files.get(u), unit_roots.get(u))
     lock = threading.Lock()
 
     stop = []
@@ -278,8 +283,8 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     def one(i):
         if a.spend.exceeded or stop:
             return
-        rec = validate_one(backend, ws, dict(findings[i]), vcfg, cfg.threat_model,
-                           unit_files.get(findings[i].get("unit")))
+        sws, f, files = scoped(i)
+        rec = validate_one(backend, sws, f, vcfg, cfg.threat_model, files)
         if rec.get("error") and is_fatal_msg(rec["error"]):
             stop.append(rec["error"])
             raise FatalBackendError(rec["error"])
@@ -297,7 +302,7 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     if getattr(a, "batch", False) and todo:
         if model.startswith("openai-compat:"):
             sys.exit("--batch is for Claude models (Message Batches)")
-        validate_batch(todo, findings, vcfg, cfg, ws, unit_files, backend, model,
+        validate_batch(todo, scoped, vcfg, cfg, backend, model,
                        out_dir / f"{stem}.batch.json", a, log, save)
     else:
         with ThreadPoolExecutor(max_workers=max(1, a.workers)) as pool:
@@ -317,17 +322,18 @@ def run_validation(cell, audit, vcfg: ValidationConfig, ws, out_dir, a, log) -> 
     part.unlink(missing_ok=True)
 
 
-def validate_batch(todo, findings, vcfg, cfg, ws, unit_files, backend, model, state,
+def validate_batch(todo, scoped, vcfg, cfg, backend, model, state,
                    a, log, save) -> None:
-    """The same validation calls through Message Batches, at half price."""
+    """The same validation calls through Message Batches, at half price.
+    scoped(i) gives (workspace, finding, unit files) as the validator sees them."""
     pending, prompts = {}, {}
     for i in todo:
-        rec, prompt, file = prepare_validation(ws, dict(findings[i]), vcfg, cfg.threat_model,
-                                               unit_files.get(findings[i].get("unit")))
+        sws, f, files = scoped(i)
+        rec, prompt, file = prepare_validation(sws, f, vcfg, cfg.threat_model, files)
         if prompt is None:
             save(i, rec)
         else:
-            pending[i], prompts[f"f{i}"] = (rec, file), prompt
+            pending[i], prompts[f"f{i}"] = (rec, file, sws), prompt
     if not prompts:
         return
     est = sum(est_tokens(p) for p in prompts.values())
@@ -350,12 +356,12 @@ def validate_batch(todo, findings, vcfg, cfg, ws, unit_files, backend, model, st
         i = int(key[1:])
         if i not in pending:
             continue
-        rec, file = pending[i]
+        rec, file, sws = pending[i]
         if isinstance(r, str):
             rec["error"] = r
             fatal = fatal or (r if is_fatal_msg(r) else None)
         else:
-            rec = finish_validation(rec, r, ws, vcfg, file)
+            rec = finish_validation(rec, r, sws, vcfg, file)
             rec["price_mult"] = BATCH_DISCOUNT
             a.spend.add(records_cost(model, [rec]))
         save(i, rec)

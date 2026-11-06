@@ -161,6 +161,31 @@ def validator_code(ws: Workspace, file: str, line: int, cfg: ValidationConfig,
     return "".join(parts), fallback
 
 
+def _strip(v, prefix: str):
+    if isinstance(v, str):
+        return v.replace(prefix, "")
+    if isinstance(v, list):
+        return [_strip(x, prefix) for x in v]
+    if isinstance(v, dict):
+        return {k: _strip(x, prefix) for k, x in v.items()}
+    return v
+
+
+def scope_to_root(ws: Workspace, finding: dict, unit_files: list[str] | None,
+                  root: str | None) -> tuple[Workspace, dict, list[str] | None]:
+    """Confine the validator to the unit's project, the same view the auditor had.
+    In a multi-project workspace the project folder name carries the CVE id
+    (e.g. apache__jspwiki_CVE-2019-10076_...), so showing repo-relative paths
+    leaks the answer key to the verifier."""
+    root = (root or "").strip("/")
+    if not root:
+        return ws, finding, unit_files
+    prefix = root + "/"
+    files = None if unit_files is None else [f[len(prefix):] if f.startswith(prefix) else f
+                                             for f in unit_files]
+    return Workspace(str(ws.root / root)), _strip(finding, prefix), files
+
+
 def prepare_validation(ws: Workspace, finding: dict, cfg: ValidationConfig,
                        threat_model: str = "all-external",
                        unit_files: list[str] | None = None) -> tuple[dict, str | None, str | None]:

@@ -7,7 +7,7 @@ import eval.experiment as ex
 from auditor.batch import run_batch
 from auditor.llm import AnthropicBackend
 from eval.pilot import summarize
-from tests.conftest import FakeBackend, report
+from tests.conftest import FakeBackend, reply, report
 
 
 def _message(verdict="confirmed"):
@@ -186,3 +186,48 @@ def test_report_lists_cves_the_validator_lost(tmp_path, monkeypatch, capsys):
     text = capsys.readouterr().out
     assert "CVEs the validator lost" in text
     assert "| CVE-2021-9 |" in text and "name is checked upstream" in text
+
+
+def test_verifier_never_sees_the_cve_id(tmp_path, monkeypatch):
+    """Project folders are named <owner>__<repo>_<CVE>_<version>. The auditor is
+    confined to the project, so the verifier must be too, or its prompt carries
+    the answer key (and it cited the CVE in its reasons when it wasn't)."""
+    from tests.test_cwe_bench_java import _project_repo
+    repo, labels = _project_repo(tmp_path)
+    lp = tmp_path / "labels.json"
+    lp.write_text(json.dumps(labels))
+    batches = FakeBatches()
+    sent = []
+
+    def backend(model, *_a, **_k):
+        if model == "claude-sonnet-5-5":
+            return _backend(batches)
+        if model == "claude-opus-5-5":
+            def verify(conv):
+                sent.append(conv.sent[-1][1])
+                return reply(json.dumps({"verdict": "confirmed"}), stop="end_turn")
+            return FakeBackend(verify, model=model)
+        return FakeBackend(lambda conv: report([{"bug_class": "path", "line": 3,
+                                                 "file": "src/main/java/Files.java",
+                                                 "cwe": "CWE-22", "confidence": 0.9}]),
+                           model=model)
+
+    monkeypatch.setattr(ex, "make_backend", backend)
+    base = ["experiment.py", str(repo), str(lp), "--configs", "C0", "--runs", "1",
+            "--bugs", "path", "--no-baseline", "--workers", "1", "--skip-preflight",
+            "--models", "claude-haiku-5-5", "--validation", "plain", "--out", str(tmp_path / "r")]
+    for extra in (["--verifier-model", "claude-sonnet-5-5", "--batch"],
+                  ["--verifier-model", "claude-opus-5-5"]):
+        monkeypatch.setattr(sys, "argv", base + extra)
+        ex.main()
+    prompts = [r["params"]["messages"][0]["content"] for r in batches.created[-1]] + sent
+    assert len(prompts) == 2
+    for p in prompts:
+        assert "CVE-2021-9" not in p and "acme__app" not in p
+        assert "=== src/main/java/Files.java ===" in p
+    run = tmp_path / "r" / "claude-haiku-5-5" / "fixed-nosa" / "run1"
+    vals = {v.name: json.loads(v.read_text())["records"] for v in run.glob("val-*.json")}
+    assert len(vals) == 2
+    for recs in vals.values():            # the re-rooted file still resolves
+        assert recs[0]["verdict"] and "file_not_found" not in recs[0]["rejected_by"]
+    assert vals["val-plain@claude-opus-5-5.json"][0]["confirmed"]
