@@ -29,6 +29,11 @@ KEYWORDS = {
               # every custom Serializable hook
               "Yaml", "ObjectInputStream", ".readObject()", "fromXML",
               "InitialContext", "Nashorn"],
+    # added for hunt.py; no CWE-Bench-Java run used sqli, so no tuned number moves
+    "sqli": ["executeQuery", "executeUpdate", "prepareStatement", "createStatement",
+             "createQuery", "createNativeQuery", "createSQLQuery", "JdbcTemplate",
+             "jdbcTemplate", "Statement", "SELECT ", "select ", "ORDER BY", "order by",
+             "WHERE ", "where "],
 }
 # Tuned on the 40-CVE CWE-Bench-Java workspace with prefilter_check.py --keywords.
 # Dropped there because they kept many files (XStream 623, getParameter( 295,
