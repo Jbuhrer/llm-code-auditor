@@ -114,3 +114,16 @@ def test_budget_cap_stops_new_work_and_a_rerun_finishes(tmp_path):
     assert "not reached" in (out / "report.md").read_text(encoding="utf-8")
     run_hunt(str(repo), out, HC, Budget(None), make, log=lambda m: None)
     assert b["claude-sonnet-5-5"].calls == 2 and b["claude-opus-5-5"].calls == 2
+
+
+def test_hunt_check_finds_the_cve_method(tmp_path):
+    from eval.hunt_check import check
+    from tests.test_cwe_bench_java import _project_repo
+    projects, labels = _project_repo(tmp_path)
+    slug = labels[0]["project"]
+    out = tmp_path / "out"
+    _, make = _models()
+    run_hunt(str(projects / slug), out, HC, Budget(None), make, log=lambda m: None)
+    r = check(out, labels, projects)
+    assert r["cve"] == "CVE-2021-9" and r["first_rank"] == 1 and r["top"]
+    assert r["deep_dived"] and r["deep_verdict"] == "confirmed"
