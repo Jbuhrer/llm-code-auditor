@@ -167,7 +167,8 @@ class HuntConfig:
     triage_model: str = "claude-sonnet-5-5"
     deep_model: str = "claude-opus-5-5"
     deep_top: int = 15               # deep-dive this many of the best-scored flags
-    min_score: float = 0.2           # ...but only if triage scored them at least this
+    min_score: float = 0.0           # triage ranks; deep_top alone caps cost, so by
+                                     # default triage never vetoes a flag out of the dive
     screen_effort: str | None = "medium"
     triage_effort: str | None = "medium"
     deep_effort: str | None = "high"

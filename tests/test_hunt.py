@@ -66,7 +66,14 @@ def _models():
     return b, (lambda model, effort=None: b[model])
 
 
-HC = HuntConfig(bug_classes=("path",), triage_model="claude-haiku-5-5", workers=1)
+# min_score 0.2 here so the test can check a low-scored flag is ranked but not
+# deep-dived; the shipped default is 0.0 (deep_top alone caps the dive).
+HC = HuntConfig(bug_classes=("path",), triage_model="claude-haiku-5-5", workers=1,
+                min_score=0.2)
+
+
+def test_default_min_score_lets_triage_rank_without_vetoing():
+    assert HuntConfig().min_score == 0.0
 
 
 def test_units_skip_tests_and_files_with_no_relevant_api(tmp_path):
