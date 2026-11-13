@@ -179,6 +179,7 @@ class HuntConfig:
     semgrep: bool = False
     prefilter: bool = True
     exts: tuple[str, ...] = (".java",)
+    since: str | None = None         # a git ref: hunt only files changed since it
     workers: int = 8
 
     def as_dict(self):
@@ -213,18 +214,25 @@ class Store:
 # ---------------------------------------------------------------- units
 
 def hunt_units(ws: Workspace, classes, prefilter: bool = True,
-               exts=(".java",)) -> tuple[list[Unit], dict]:
+               exts=(".java",), since: str | None = None) -> tuple[list[Unit], dict]:
     """One unit per product source file. Tests, docs and samples are skipped;
-    with prefilter, so are files that mention no API for the bug classes."""
+    with prefilter, so are files that mention no API for the bug classes. With
+    `since` (a git ref), files unchanged since that ref are skipped too, so a
+    hunt can target just recent changes (a regression, a release delta)."""
     from .prefilter import is_non_product, is_test, keep
+    changed = set(ws.changed_files(since)) if since else None
     units = []
     stats = {"files": 0, "tests": 0, "non_product": 0, "no_keyword": 0, "kept": 0}
+    if changed is not None:
+        stats["unchanged"] = 0
     for f in ws.source_files(set(exts)):
         stats["files"] += 1
         if is_test(f):
             stats["tests"] += 1
         elif is_non_product(f):
             stats["non_product"] += 1
+        elif changed is not None and f not in changed:
+            stats["unchanged"] += 1
         elif prefilter and not keep("\n".join(ws.lines(f)), list(classes)):
             stats["no_keyword"] += 1
         else:
@@ -525,8 +533,9 @@ def write_report(out: Path, repo: str, hc: HuntConfig, stats: dict, recs, rows,
          f"{', '.join(hc.bug_classes)}. Hunt prompt {HUNT_VERSION}.", "",
          f"Files: {stats.get('files', 0)} found, {stats.get('kept', 0)} audited "
          f"({stats.get('tests', 0)} test, {stats.get('non_product', 0)} docs/samples, "
-         f"{stats.get('no_keyword', 0)} with no relevant API skipped). "
-         f"Screened {len(recs)}, flags {len(rows)}.", "",
+         f"{stats.get('no_keyword', 0)} with no relevant API"
+         + (f", {stats.get('unchanged', 0)} unchanged since {hc.since}" if hc.since else "")
+         + f" skipped). Screened {len(recs)}, flags {len(rows)}.", "",
          f"Cost: screen ${costs['screen']:.2f}, triage ${costs['triage']:.2f}, "
          f"deep ${costs['deep']:.2f}, total ${costs['total']:.2f}.", "",
          "Scores are model estimates, not proof. Quotes the model cited are checked "
@@ -595,7 +604,7 @@ def write_report(out: Path, repo: str, hc: HuntConfig, stats: dict, recs, rows,
 def run_hunt(repo: str, out: Path, hc: HuntConfig, budget: Budget, make, log=print) -> Path:
     ws = Workspace(repo)
     store = Store(Path(out))
-    units, stats = hunt_units(ws, hc.bug_classes, hc.prefilter, hc.exts)
+    units, stats = hunt_units(ws, hc.bug_classes, hc.prefilter, hc.exts, hc.since)
     (Path(out)).mkdir(parents=True, exist_ok=True)
     (Path(out) / "meta.json").write_text(json.dumps(
         {"repo": str(Path(repo).resolve()), "config": hc.as_dict(), "stats": stats,

@@ -2,8 +2,9 @@
 """
 Hunt for real vulnerabilities in a project you've cloned. No labels needed.
 
-  python hunt.py ~/targets/jspwiki --dry-run          # files, flags, cost estimate
-  python hunt.py ~/targets/jspwiki --max-usd 15       # screen, triage, deep dive
+  python hunt.py ~/targets/some-repo --dry-run        # files, flags, cost estimate
+  python hunt.py ~/targets/some-repo --max-usd 15     # screen, triage, deep dive
+  python hunt.py ~/targets/some-repo --since v1.2.3   # only code changed since a tag
 
 Stages: a screen model flags anything plausible in every relevant file, a triage
 model scores every flag (nothing is thrown out), and the strongest model
@@ -49,6 +50,9 @@ def main():
     ap.add_argument("--semgrep", action="store_true", help="give the screen semgrep too")
     ap.add_argument("--no-prefilter", action="store_true",
                     help="screen every product file, not just ones using a relevant API")
+    ap.add_argument("--since", default=None, metavar="REF",
+                    help="only hunt files changed since this git ref (tag, commit, "
+                         "branch), e.g. --since v1.2.3 to chase a release regression")
     ap.add_argument("--max-usd", type=float, default=20.0,
                     help="stop starting new work past this (default $20); 0 = no cap")
     ap.add_argument("--dry-run", action="store_true")
@@ -64,14 +68,19 @@ def main():
                     triage_model=a.triage_model, deep_model=a.deep_model,
                     deep_top=a.deep_top, min_score=a.min_score, deep_effort=a.deep_effort,
                     workers=a.workers, exts=tuple(a.exts), semgrep=a.semgrep,
-                    prefilter=not (a.no_prefilter or exhaustive))
+                    prefilter=not (a.no_prefilter or exhaustive), since=a.since)
     out = a.out or Path("results") / f"hunt-{Path(a.repo).resolve().name}"
 
-    units, stats = hunt_units(Workspace(a.repo), hc.bug_classes, hc.prefilter, hc.exts)
+    try:
+        units, stats = hunt_units(Workspace(a.repo), hc.bug_classes, hc.prefilter,
+                                  hc.exts, hc.since)
+    except ValueError as e:
+        sys.exit(str(e))
     est = estimate(len(units), hc)
     money = lambda v: "unpriced" if v is None else f"~${v:.2f}"   # noqa: E731
     print(f"{stats['files']} source file(s): {stats['kept']} to screen, {stats['tests']} "
-          f"test, {stats['non_product']} docs/samples, {stats['no_keyword']} no relevant API")
+          f"test, {stats['non_product']} docs/samples, {stats['no_keyword']} no relevant API"
+          + (f", {stats['unchanged']} unchanged since {a.since}" if a.since else ""))
     print(f"estimate: screen {money(est['screen'])} ({hc.screen_model}), "
           f"~{est['flags']} flags -> triage {money(est['triage'])} ({hc.triage_model}), "
           f"{est['deep_dives']} deep dive(s) {money(est['deep'])} ({hc.deep_model})")

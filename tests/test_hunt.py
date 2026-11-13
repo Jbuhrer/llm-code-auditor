@@ -1,5 +1,9 @@
 """hunt.py: screen -> triage (rank, never drop) -> deep dive, offline."""
 import json
+import shutil
+import subprocess
+
+import pytest
 
 from auditor.budget import Budget
 from auditor.hunt import HUNT_THREAT, HuntConfig, estimate, hunt_units, run_hunt
@@ -82,6 +86,62 @@ def test_units_skip_tests_and_files_with_no_relevant_api(tmp_path):
                                            "src/main/java/Upload.java"]
     assert stats == {"files": 4, "tests": 1, "non_product": 0, "no_keyword": 1, "kept": 2}
     assert estimate(2, HC)["screen"] > 0
+
+
+def _git(repo, *args):
+    subprocess.run(["git", "-C", str(repo), *args], check=True,
+                   capture_output=True, text=True)
+
+
+def _git_repo(tmp_path):
+    repo = _repo(tmp_path)
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "base")
+    return repo
+
+
+def test_since_scopes_hunt_to_changed_and_new_files(tmp_path):
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    repo = _git_repo(tmp_path)
+    # modify one committed product file and add a brand-new (untracked) one; both
+    # use a path API, so prefilter keeps them. Upload.java and Math.java are
+    # untouched since the baseline and must drop out.
+    (repo / "src/main/java/Files.java").write_text(FILES + "// touched\n")
+    (repo / "src/main/java/New.java").write_text(
+        "class New { void g(String p) { new java.io.File(base, p); } }\n")
+    units, stats = hunt_units(Workspace(str(repo)), ["path"], since="HEAD")
+    assert sorted(u.id for u in units) == ["src/main/java/Files.java",
+                                           "src/main/java/New.java"]
+    assert stats == {"files": 5, "tests": 1, "non_product": 0, "no_keyword": 0,
+                     "unchanged": 2, "kept": 2}
+
+
+def test_since_with_no_changes_screens_nothing(tmp_path):
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    repo = _git_repo(tmp_path)
+    units, stats = hunt_units(Workspace(str(repo)), ["path"], since="HEAD")
+    assert units == [] and stats["kept"] == 0 and stats["unchanged"] == 3
+
+
+def test_changed_files_rejects_unknown_ref(tmp_path):
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    ws = Workspace(str(_git_repo(tmp_path)))
+    with pytest.raises(ValueError):
+        ws.changed_files("no-such-ref-xyz")
+
+
+def test_changed_files_needs_a_git_repo(tmp_path):
+    if not shutil.which("git"):
+        pytest.skip("git not available")
+    ws = Workspace(str(_repo(tmp_path)))   # never git-init'd
+    with pytest.raises(ValueError):
+        ws.changed_files("HEAD")
 
 
 def test_hunt_ranks_everything_and_deep_dives_the_top(tmp_path):
