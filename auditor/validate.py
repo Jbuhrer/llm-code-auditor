@@ -26,6 +26,33 @@ from .units import est_tokens
 QUOTE_SLACK = 2          # a quote may sit this many lines off the cited line
 MAX_TOKENS = 16000       # thinking models need room; output is short JSON
 
+# Execution-oracle outcomes (RO2, opt-in "execute" evidence). An execution runner
+# takes (workspace, finding, verdict, resolved file) and returns one of these with a
+# short detail string.
+EXEC_CONFIRMED, EXEC_REFUTED, EXEC_ABSTAIN = "confirmed", "refuted", "abstain"
+
+
+def no_execution(ws: "Workspace", finding: dict, verdict: dict, file: str) -> tuple[str, str]:
+    """The default runner: builds nothing, always abstains. With it, requiring
+    'execute' is a no-op that falls back to the model verdict, so the plumbing stays
+    inert until a real build-and-run runner is passed in."""
+    return EXEC_ABSTAIN, "no execution runner configured"
+
+
+def run_execution(ws: "Workspace", finding, verdict: dict, file: str,
+                  runner) -> tuple[str, str]:
+    """Call the execution runner defensively: any exception or out-of-range return
+    becomes an abstain, so a broken or crashing runner can only fall back, never
+    wrongly confirm or reject a finding."""
+    runner = runner or no_execution
+    try:
+        outcome, detail = runner(ws, finding or {}, verdict, file)
+    except Exception as e:
+        return EXEC_ABSTAIN, f"runner error: {type(e).__name__}: {str(e)[:150]}"
+    if outcome not in (EXEC_CONFIRMED, EXEC_REFUTED, EXEC_ABSTAIN):
+        return EXEC_ABSTAIN, f"runner returned bad outcome {outcome!r}"
+    return outcome, str(detail)[:300]
+
 
 def extract_json(text: str) -> dict | None:
     """First balanced {...} object in text, tolerant of prose and code fences."""
@@ -210,9 +237,10 @@ def prepare_validation(ws: Workspace, finding: dict, cfg: ValidationConfig,
 
 def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
                  threat_model: str = "all-external",
-                 unit_files: list[str] | None = None) -> dict:
+                 unit_files: list[str] | None = None, runner=None) -> dict:
     """Returns a record: confirmed (bool), rejected_by, checks, verdict, usage,
-    seconds, and error/refusal if the call failed."""
+    seconds, and error/refusal if the call failed. `runner` is the execution oracle
+    for the opt-in 'execute' evidence; the default abstains (no-op)."""
     rec, prompt, file = prepare_validation(ws, finding, cfg, threat_model, unit_files)
     if prompt is None:
         return rec
@@ -226,12 +254,19 @@ def validate_one(backend, ws: Workspace, finding: dict, cfg: ValidationConfig,
         rec["seconds"] = round(time.monotonic() - t0, 2)
         return rec
     rec["seconds"] = round(time.monotonic() - t0, 2)
-    return finish_validation(rec, reply, ws, cfg, file)
+    return finish_validation(rec, reply, ws, cfg, file, finding, runner)
 
 
 def finish_validation(rec: dict, reply, ws: Workspace, cfg: ValidationConfig,
-                      file: str) -> dict:
-    """Turn the model's reply into the final record (refusal, parse, checks)."""
+                      file: str, finding: dict | None = None, runner=None) -> dict:
+    """Turn the model's reply into the final record (refusal, parse, checks).
+
+    When 'execute' is required, an execution runner gets the last word: a PoC that
+    demonstrably triggers confirms the finding over any model doubt; a PoC that runs
+    but doesn't refutes it; and an abstain (can't build or run) falls back to the
+    model-side verdict, so a target the runner can't build behaves exactly as if
+    'execute' weren't required. That abstain-equals-fallback rule is what keeps the
+    comparison uniform across benchmarks, where most code won't build in-place."""
     rec["usage"] = reply.usage
     if reply.stop_reason == "refusal":
         rec["refused"] = True
@@ -243,9 +278,26 @@ def finish_validation(rec: dict, reply, ws: Workspace, cfg: ValidationConfig,
         return rec
     rec["verdict"] = verdict
     checks, failed = apply_checks(ws, verdict, cfg.evidence, file)
-    rec["checks"] = checks
     if verdict.get("verdict") != "confirmed":
         failed.insert(0, "verdict")
+    if "execute" in cfg.evidence:
+        outcome, detail = run_execution(ws, finding, verdict, file, runner)
+        checks["execute"], checks["execute_detail"] = outcome, detail
+        if outcome == EXEC_CONFIRMED:
+            rec["checks"] = checks
+            rec["rejected_by"] = []
+            rec["model_rejected_by"] = failed   # what the model side alone would have said
+            rec["confirmed"] = True
+            return rec
+        if outcome == EXEC_REFUTED:
+            if "execute" not in failed:
+                failed.append("execute")
+            rec["checks"] = checks
+            rec["rejected_by"] = failed
+            rec["confirmed"] = False
+            return rec
+        # abstain: fall through to the model-side result
+    rec["checks"] = checks
     rec["rejected_by"] = failed
     rec["confirmed"] = not failed
     return rec

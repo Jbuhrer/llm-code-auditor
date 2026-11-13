@@ -26,6 +26,17 @@ EVIDENCE = {
     "poc": "a concrete input that traverses the path",
 }
 
+# Mechanical, opt-in evidence that needs no prompt text: instead of asking the model
+# for anything new, the validator reuses the model's own output (the poc) and an
+# execution runner. Kept out of EVIDENCE and ALL_EVIDENCE on purpose, so the prompt,
+# the presets (C0-C4), the evidence sweep, and the prompt fingerprint are all
+# unchanged. Request it explicitly, e.g. --evidence path+execute or --evidence execute.
+MECHANICAL_EVIDENCE = {
+    "execute": "build and run the reported PoC: confirm the finding if it triggers, "
+               "reject it if the PoC runs but doesn't, abstain (fall back to the "
+               "model verdict) if the code can't be built or run",
+}
+
 DEFAULT_MODEL = "claude-opus-5-5"
 
 
@@ -80,6 +91,7 @@ class Preset:
 
 
 ALL_EVIDENCE = tuple(EVIDENCE)
+KNOWN_EVIDENCE = {**EVIDENCE, **MECHANICAL_EVIDENCE}
 
 # The named configurations. C0 is the model-only baseline (the old research.py
 # file-by-file setup), C4 is the full agent. Each step adds one component.
@@ -94,15 +106,17 @@ PRESETS = {
 
 
 def parse_evidence(spec: str) -> tuple[str, ...]:
-    """'plain' -> (), 'all' -> every item, 'path+poc' -> ('path', 'poc')."""
+    """'plain' -> (), 'all' -> every canonical item, 'path+poc' -> ('path', 'poc').
+    The mechanical 'execute' item is accepted only when named explicitly (e.g.
+    'path+execute'), never via 'all', so the C4 preset and the sweep are unchanged."""
     if spec in ("plain", "none", ""):
         return ()
     if spec == "all":
         return ALL_EVIDENCE
     items = tuple(s for s in spec.split("+") if s)
-    bad = [s for s in items if s not in EVIDENCE]
+    bad = [s for s in items if s not in KNOWN_EVIDENCE]
     if bad:
-        raise ValueError(f"unknown evidence item(s) {bad}; known: {list(EVIDENCE)}")
+        raise ValueError(f"unknown evidence item(s) {bad}; known: {list(KNOWN_EVIDENCE)}")
     return items
 
 
