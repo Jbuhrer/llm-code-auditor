@@ -116,12 +116,14 @@ runs: `auto` changes as the registry updates.
 
 ## Not built yet
 
-- CWE-Bench-Java loader (IRIS's 120 real CVEs), reported separately from Juliet.
 - CodeQL as a second static-analysis tool.
 - RO4: semantics-preserving edits (SecLLMHolmes-style) and runs on current
   versions of active open-source projects.
 - Chronological splits and contamination checks (PrimeVul, LessLeak-Bench) for
   the real-CVE benchmark.
+
+(The CWE-Bench-Java loader, hunt mode, the screen-then-verify cascade, and the
+opt-in `execute` evidence item are built; see the README.)
 
 ## Optional extras
 

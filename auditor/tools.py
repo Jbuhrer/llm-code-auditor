@@ -128,6 +128,40 @@ class Workspace:
             out.append(f.relative_to(self.root).as_posix())
         return out
 
+    def changed_files(self, ref: str) -> list[str]:
+        """Repo-relative POSIX paths of source files that differ from `ref`
+        (added or modified, plus still-untracked files), for scoping a hunt to
+        recent changes. Renames count as the new path; deletions are dropped.
+        The diff is `ref` against the working tree, so uncommitted edits count.
+        Raises ValueError if this isn't a git repo or `ref` is unknown."""
+        git = shutil.which("git")
+        if not git:
+            raise ValueError("git not found on PATH; --since needs git")
+
+        def run(args: list[str]) -> subprocess.CompletedProcess:
+            return subprocess.run([git, "-C", str(self.root), *args],
+                                  capture_output=True, text=True, timeout=60)
+
+        # --relative scopes to (and reports relative to) this workspace even when
+        # it sits below the git root; -z avoids quotepath mangling of odd names.
+        diff = run(["diff", "--name-only", "-z", "--no-renames", "--relative",
+                    "--diff-filter=d", ref])
+        if diff.returncode != 0:
+            raise ValueError(f"git diff against {ref!r} failed: "
+                             f"{diff.stderr.strip()[:200] or 'is it a git repo?'}")
+        others = run(["ls-files", "--others", "--exclude-standard", "-z"])
+        names = [n for n in diff.stdout.split("\0") if n]
+        if others.returncode == 0:
+            names += [n for n in others.stdout.split("\0") if n]
+        src = set(self.source_files())       # confine to what a hunt would audit
+        seen, out = set(), []
+        for n in names:
+            p = n.replace("\\", "/")
+            if p in src and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return sorted(out)
+
     def grep(self, pattern: str, glob: str = "**/*") -> str:
         """Search the repo with ripgrep if present, else Python. A bad regex
         falls back to a literal search, and any error is returned to the agent

@@ -7,7 +7,8 @@ import pytest
 
 from auditor.config import ValidationConfig, ALL_EVIDENCE
 from auditor.tools import Workspace
-from auditor.validate import extract_json, validate_one, check_path_steps
+from auditor.validate import (extract_json, validate_one, check_path_steps,
+                              EXEC_CONFIRMED, EXEC_REFUTED, EXEC_ABSTAIN)
 from eval.juliet_functions import function_spans, region_of, locate
 from eval.metrics import score, default_mode
 from eval.stats import mcnemar, bootstrap_ci, majority, _binom_two_sided
@@ -75,6 +76,74 @@ def test_validator_failures(juliet_repo):
     def boom(c):
         raise TimeoutError("slow")
     assert "slow" in validate_one(FakeBackend(boom), ws, f, cfg)["error"]
+
+
+# ------------------------------------------------------------ execute oracle (RO2)
+
+def _runner(outcome, detail="x"):
+    return lambda ws, finding, verdict, file: (outcome, detail)
+
+
+def test_parse_evidence_execute_is_opt_in():
+    from auditor.config import parse_evidence
+    assert parse_evidence("execute") == ("execute",)
+    assert parse_evidence("path+execute") == ("path", "execute")
+    assert "execute" not in ALL_EVIDENCE            # 'all' and the C4 preset never include it
+    assert parse_evidence("all") == ALL_EVIDENCE
+    with pytest.raises(ValueError):
+        parse_evidence("bogus")
+
+
+def test_execute_adds_no_prompt_text():
+    from auditor.prompts import validator_prompt
+    base = validator_prompt("{}", "code", ("path",))
+    assert validator_prompt("{}", "code", ("path", "execute")) == base
+    assert validator_prompt("{}", "code", ("execute",)) == validator_prompt("{}", "code", ())
+
+
+def test_execute_confirmation_overrides_model_rejection(juliet_repo):
+    repo, _ = juliet_repo
+    f = {"bug_class": "cmdi", "file": JF, "line": 14, "cwe": "CWE-78"}
+    rec = validate_one(FakeBackend([_verdict(verdict="rejected")]), Workspace(str(repo)),
+                       f, ValidationConfig(True, ("execute",)),
+                       runner=_runner(EXEC_CONFIRMED, "sentinel file created"))
+    assert rec["confirmed"] is True and rec["rejected_by"] == []
+    assert rec["checks"]["execute"] == EXEC_CONFIRMED
+    assert "verdict" in rec["model_rejected_by"]    # what the model alone would have said
+
+
+def test_execute_refutation_overrides_model_confirmation(juliet_repo):
+    repo, _ = juliet_repo
+    f = {"bug_class": "cmdi", "file": JF, "line": 14, "cwe": "CWE-78"}
+    rec = validate_one(FakeBackend([_verdict()]), Workspace(str(repo)), f,
+                       ValidationConfig(True, ("execute",)),
+                       runner=_runner(EXEC_REFUTED, "poc ran, no shell exec"))
+    assert rec["confirmed"] is False and "execute" in rec["rejected_by"]
+    assert rec["checks"]["execute"] == EXEC_REFUTED
+
+
+def test_execute_abstain_falls_back_to_the_model(juliet_repo):
+    repo, _ = juliet_repo
+    ws = Workspace(str(repo))
+    f = {"bug_class": "cmdi", "file": JF, "line": 14, "cwe": "CWE-78"}
+    cfg = ValidationConfig(True, ("execute",))
+    # no runner -> abstain -> the model verdict stands, both ways
+    ok = validate_one(FakeBackend([_verdict()]), ws, f, cfg)
+    assert ok["confirmed"] is True and ok["rejected_by"] == []
+    assert ok["checks"]["execute"] == EXEC_ABSTAIN
+    no = validate_one(FakeBackend([_verdict(verdict="rejected")]), ws, f, cfg)
+    assert no["confirmed"] is False and no["rejected_by"] == ["verdict"]
+
+
+def test_execute_runner_error_abstains_not_crashes(juliet_repo):
+    repo, _ = juliet_repo
+    f = {"bug_class": "cmdi", "file": JF, "line": 14, "cwe": "CWE-78"}
+    def boom(ws, finding, verdict, file):
+        raise RuntimeError("javac missing")
+    rec = validate_one(FakeBackend([_verdict()]), Workspace(str(repo)), f,
+                       ValidationConfig(True, ("execute",)), runner=boom)
+    assert rec["confirmed"] is True and rec["checks"]["execute"] == EXEC_ABSTAIN
+    assert "javac missing" in rec["checks"]["execute_detail"]
 
 
 # ------------------------------------------------------------ Juliet functions

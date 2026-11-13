@@ -225,6 +225,8 @@ def validator_prompt(finding_json: str, code: str, evidence: tuple[str, ...],
     fields = ['"verdict": "confirmed" | "rejected"']
     steps = []
     for item in evidence:
+        if item not in EVIDENCE_INSTRUCTIONS:
+            continue   # mechanical item (e.g. execute): checked after the call, no prompt text
         _, field, instr = EVIDENCE_INSTRUCTIONS[item]
         fields.append(field)
         steps.append(f"- {instr}")
