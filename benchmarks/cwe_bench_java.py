@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CWE-Bench-Java loader. See README section "CWE-Bench-Java" for usage."""
+"""CWE-Bench-Java loader. See the README ("Running the experiment") for usage."""
 from __future__ import annotations
 import csv
 import io
