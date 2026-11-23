@@ -24,6 +24,12 @@ PRICES = {
     "claude-sonnet-4-6": (3.00, 15.00, 0.30),
     "claude-haiku-5-5": (0.10, 0.50, 0.01),
     "claude-haiku-4-5": (1.00, 5.00, 0.10),
+    # open-weight tier, served via OpenRouter. These are the floor-route rates for
+    # z.ai GLM 5.3; OpenRouter routes the same slug across providers at varying
+    # prices (input ~0.07-1.40, output ~1.40-4.40 per M), so pin a provider or use
+    # Floor routing for these numbers to hold. Recompute from saved token counts if
+    # the route changes.
+    "z-ai/glm-5.3": (0.0699, 1.40, 0.0689),
 }
 CACHE_WRITE_MULT = 1.25
 BATCH_DISCOUNT = 0.5   # Message Batches bill every token at half price

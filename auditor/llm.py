@@ -184,28 +184,36 @@ class OpenAICompatBackend:
         self.client = client
 
     def create(self, max_tokens: int, kwargs: dict):
+        dropped: set[str] = set()   # per-call, so concurrent workers each heal their own request
         while True:
             kw = {**kwargs, self.token_param: max_tokens}
-            if self.temperature is not None:
+            if self.temperature is not None and "temperature" not in dropped:
                 kw["temperature"] = self.temperature
-            if self.effort:
+            if self.effort and "effort" not in dropped:
                 kw["reasoning_effort"] = self.effort
             try:
                 return self.client.chat.completions.create(**kw)
             except Exception as e:
-                if type(e).__name__ != "BadRequestError" or not self._adapt(str(e)):
+                if type(e).__name__ != "BadRequestError" or not self._adapt(str(e), dropped):
                     raise
 
-    def _adapt(self, msg: str) -> bool:
-        """Servers disagree on these three parameters, so learn from the first 400.
-        Each can only change once, so this can't loop. A dropped setting is no longer
-        held fixed by the experiment, so say so."""
-        if self.token_param == "max_tokens" and "max_tokens" in msg:
+    def _adapt(self, msg: str, dropped: set) -> bool:
+        """Servers disagree on these three parameters, so learn from the first 400 and
+        retry. `dropped` is per-call: with parallel workers sharing this backend, each
+        call must retry its OWN rejected request, so we can't gate on shared self.* state
+        (a sibling worker may have already cleared it, which used to make the loser re-raise
+        instead of retrying). Each param changes at most once per call, so this can't loop.
+        self.* is updated too so later calls skip a param already known dead, and we say so
+        since a dropped setting is no longer held fixed by the experiment."""
+        if "max_tokens" in msg and "tokens" not in dropped:
+            dropped.add("tokens")
             self.token_param = "max_completion_tokens"
-        elif self.temperature is not None and "temperature" in msg:
+        elif "temperature" in msg and "temperature" not in dropped:
+            dropped.add("temperature")
             self.temperature = None
             print(f"  ! {self.model} rejects temperature, using its default", file=sys.stderr)
-        elif self.effort and "reasoning_effort" in msg:
+        elif ("reasoning_effort" in msg or "thinking" in msg) and "effort" not in dropped:
+            dropped.add("effort")
             self.effort = None
             print(f"  ! {self.model} rejects reasoning_effort, using its default", file=sys.stderr)
         else:
