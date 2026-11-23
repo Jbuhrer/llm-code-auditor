@@ -205,7 +205,7 @@ class OpenAICompatBackend:
         elif self.temperature is not None and "temperature" in msg:
             self.temperature = None
             print(f"  ! {self.model} rejects temperature, using its default", file=sys.stderr)
-        elif self.effort and "reasoning_effort" in msg:
+        elif self.effort and ("reasoning_effort" in msg or "thinking" in msg):
             self.effort = None
             print(f"  ! {self.model} rejects reasoning_effort, using its default", file=sys.stderr)
         else:
